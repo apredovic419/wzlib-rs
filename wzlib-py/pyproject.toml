@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "wzlib"
+version = "0.1.0"
+requires-python = ">=3.9"
+description = "MapleStory WZ file parser and editor — Python bindings"
+license = { text = "MIT" }
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Games/Entertainment",
+]
+
+[project.scripts]
+wzltool = "wzlib.cli:main"
+
+[tool.maturin]
+python-source = "python"
+module-name = "wzlib._wzlib"

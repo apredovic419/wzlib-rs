@@ -1,0 +1,91 @@
+name: py-wzlib release
+
+on:
+  push:
+    tags:
+      - "py-wzlib-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Build wheels for every major platform ──────────────────────────────
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (glibc)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # Linux aarch64 (glibc)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          # Linux x86_64 (musl / Alpine)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          # Linux aarch64 (musl / Alpine)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          # macOS x86_64 (Intel)
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          # macOS aarch64 (Apple Silicon)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter --manifest-path wzlib-py/Cargo.toml
+          manylinux: auto
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+
+  # ── Build sdist ────────────────────────────────────────────────────────
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path wzlib-py/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # ── Create GitHub Release ──────────────────────────────────────────────
+  release:
+    needs: [build, sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

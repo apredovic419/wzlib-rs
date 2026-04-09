@@ -1,0 +1,18 @@
+[package]
+name = "wzlib-py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for wzlib-rs — MapleStory WZ file parser and editor"
+
+[lib]
+name = "_wzlib"
+crate-type = ["cdylib"]
+
+[dependencies]
+wzlib-rs = { path = ".." }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+
+[profile.release]
+lto = true
+opt-level = 3
+strip = true

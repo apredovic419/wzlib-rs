@@ -26,14 +26,39 @@ npm run build
 node demo/serve.mjs
 ```
 
-## Testing
-
-tests across various source files. All tests are inline (`#[cfg(test)]` modules) using synthetic byte arrays — no external test data files needed.
+## Python Bindings & CLI
 
 ```bash
-cargo test --lib              # Run all unit tests
-cargo llvm-cov --lib          # Coverage report (requires cargo-llvm-cov)
-cargo llvm-cov --lib --html   # HTML coverage report
+# Install wzlib-py (from wzlib-py/)
+cd wzlib-py && pip install -e .
+
+# wzlib-py tests
+cd wzlib-py && pytest tests/
+
+# wzltool CLI — inspect and edit WZ/IMG files
+wzltool info <file>                          # File info
+wzltool ls <file> [path]                     # List images or properties
+wzltool tree <file> [path] [--depth N]       # Property tree
+wzltool get <file> <path>                    # Get value
+wzltool set <file> <path> <value> [-o out]   # Set value
+wzltool add <file> <path> <value> [-o out]   # Add node
+wzltool rm <file> <path> [-o out]            # Remove node
+wzltool extract <file> <path> -o <out>       # Extract canvas/sound
+# Add --json before subcommand for machine-readable output
+# Add -V gms/ems/bms for encryption version (default: bms)
+```
+
+See `skill/SKILL.md` for full CLI documentation and WZ file operation workflows.
+
+## Testing
+
+All tests are inline (`#[cfg(test)]` modules) using synthetic byte arrays — no external test data files needed.
+
+```bash
+cargo test --lib                        # Run all unit tests
+cargo test --lib <test_name>            # Run a single test by name (substring match)
+cargo llvm-cov --lib                    # Coverage report (requires cargo-llvm-cov)
+cargo llvm-cov --lib --html             # HTML coverage report
 ```
 
 ## Architecture
@@ -54,6 +79,11 @@ cargo llvm-cov --lib --html   # HTML coverage report
   - `list_file.rs` — List.wz parser (pre-Big Bang path index). Different binary format: `[i32 len][u16 chars × len][u16 null]` entries, XOR-encrypted with WZ key (no incremental mask).
   - `ms_file.rs` — v220+ `.ms` archive parsing and saving. Two format versions: **v1** (Snow2 stream cipher, version byte 2) and **v2** (ChaCha20 stream cipher, version byte 4). `parse_ms_file()` auto-detects v1/v2. `decrypt_entry_data()` dispatches decryption by version. `encrypt_entry_data()` and `build_ms_file()` accept an `MsVersion` parameter to select v1 or v2. V2 uses `ChaCha20StreamReader`/`ChaCha20StreamWriter` for entry tables (counter-resetting per 64-byte block) and only encrypts the first 1024 bytes of each entry. V2 salt encoding uses a `((a|0x4B)<<1)-a-75` transform with sign-extended high bytes. V2 header hash formula: `hashed_salt_len + raw_version_byte + 4 + entry_count + salt_u16_sum`.
   - `properties/mod.rs` — `WzProperty` enum definition, serialization, and accessor helpers (`as_int`, `as_float`, `as_str`, `children`, `get`).
+  - `error.rs` — `WzError` enum (thiserror-derived) and `WzResult<T>` alias used throughout the crate.
+  - `header.rs` — `WzHeader` struct: PKG1 magic + file_size + data_start + copyright. `parse()` / `write()` for roundtrip.
+  - `keys.rs` — `WzKey`: lazy XOR key stream. Wraps IV + optional user key; grows its buffer on demand via `ensure_size()`. `Index` trait requires `ensure_size` first (panics if not pre-grown).
+  - `mcv.rs` — MCV0 video container header parser (KMST v1181+). FourCC is XOR-decoded with `0xA5A5A5A5`. Exposed to TypeScript as `McvHeaderInfo` via `wasm_api.rs`.
+  - `types.rs` — Core enums: `WzMapleVersion` (Gms/Ems/Bms/Custom → IV bytes), `WzDirectoryType` (entry types 1–4), `WzPngFormat` (14 variants + Unknown; `from_raw(low, high)` / `format_id()` / `raw_data_size()` helpers).
   - `test_utils.rs` — Shared test helpers: `dummy_header()`, `make_reader()`, WZ encoding helpers (`encode_wz_ascii()`, `encode_wz_offset()`), image data builders. Used across `binary_reader`, `binary_writer`, `directory`, `image`, and `image_writer` tests.
 - **`image/`** — Pixel format decoders and encoders. `pixel.rs`/`dxt.rs` decode to RGBA8888; `encode.rs` encodes RGBA8888 back to WZ formats (BGRA4444, BGRA8888, ARGB1555, RGB565, R16, A8, RGBA1010102, RGBA32Float) and zlib-compresses raw data via `compress_png_data()`. DXT/BC encoding is not supported — use BGRA8888 for imported images.
 
