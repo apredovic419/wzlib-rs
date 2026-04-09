@@ -117,6 +117,148 @@ fn lock_err() -> PyErr {
     PyRuntimeError::new_err("internal lock poisoned")
 }
 
+// ── JSON / tree-string helpers ───────────────────────────────────────
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+// Recursively serialise a WzProperty into a JSON object matching the
+// _node_to_dict format: {path, type, value?, children? | children_count?}.
+fn prop_to_json(
+    prop: &WzProperty,
+    path_str: &str,
+    max_depth: i32,
+    depth: i32,
+    out: &mut String,
+) {
+    let type_name = prop_type_name(prop);
+    out.push('{');
+    out.push_str("\"path\":");
+    out.push_str(&json_string(path_str));
+    out.push_str(",\"type\":");
+    out.push_str(&json_string(type_name));
+
+    match prop {
+        WzProperty::Short(v) => { out.push_str(",\"value\":"); out.push_str(&v.to_string()); }
+        WzProperty::Int(v)   => { out.push_str(",\"value\":"); out.push_str(&v.to_string()); }
+        WzProperty::Long(v)  => { out.push_str(",\"value\":"); out.push_str(&v.to_string()); }
+        WzProperty::Float(v) => {
+            out.push_str(",\"value\":");
+            // NaN/inf are not valid JSON; map them to null.
+            if v.is_finite() { out.push_str(&v.to_string()); } else { out.push_str("null"); }
+        }
+        WzProperty::Double(v) => {
+            out.push_str(",\"value\":");
+            if v.is_finite() { out.push_str(&v.to_string()); } else { out.push_str("null"); }
+        }
+        WzProperty::String(s) | WzProperty::Uol(s) => {
+            out.push_str(",\"value\":");
+            out.push_str(&json_string(s));
+        }
+        WzProperty::Null => { out.push_str(",\"value\":null"); }
+        _ => {}
+    }
+
+    if let Some(children) = prop_children(prop) {
+        if !children.is_empty() {
+            if max_depth < 0 || depth < max_depth {
+                out.push_str(",\"children\":{");
+                for (i, (name, child)) in children.iter().enumerate() {
+                    if i > 0 { out.push(','); }
+                    out.push_str(&json_string(name));
+                    out.push(':');
+                    let child_path = if path_str.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", path_str, name)
+                    };
+                    prop_to_json(child, &child_path, max_depth, depth + 1, out);
+                }
+                out.push('}');
+            } else {
+                out.push_str(",\"children_count\":");
+                out.push_str(&children.len().to_string());
+            }
+        }
+    }
+
+    out.push('}');
+}
+
+// Recursively format a WzProperty as a human-readable tree matching
+// the _format_node_tree layout.
+fn prop_to_tree(
+    prop: &WzProperty,
+    label: &str,
+    line_prefix: &str,  // prepended before `label` on this node's own line
+    child_indent: &str, // prepended before connector / content of every child line
+    max_depth: i32,
+    depth: i32,
+    out: &mut String,
+) {
+    let type_name = prop_type_name(prop);
+    let val = match prop {
+        WzProperty::Short(v)  => format!(" = {}", v),
+        WzProperty::Int(v)    => format!(" = {}", v),
+        WzProperty::Long(v)   => format!(" = {}", v),
+        WzProperty::Float(v)  => format!(" = {}", v),
+        WzProperty::Double(v) => format!(" = {}", v),
+        WzProperty::String(s) | WzProperty::Uol(s) => {
+            let truncated: String = s.chars().take(60).collect();
+            let display = if s.chars().count() > 60 {
+                format!("{}...", truncated)
+            } else {
+                truncated
+            };
+            format!(" = \"{}\"", display)
+        }
+        WzProperty::Null => " = null".to_string(),
+        _ => String::new(),
+    };
+
+    out.push_str(line_prefix);
+    out.push_str(label);
+    out.push_str(" [");
+    out.push_str(type_name);
+    out.push(']');
+    out.push_str(&val);
+
+    if let Some(children) = prop_children(prop) {
+        if !children.is_empty() && (max_depth < 0 || depth < max_depth) {
+            for (i, (name, child)) in children.iter().enumerate() {
+                out.push('\n');
+                let is_last = i == children.len() - 1;
+                let connector   = if is_last { "└─" } else { "├─" };
+                let next_indent = if is_last { "  " } else { "│ " };
+                let next_line_prefix  = format!("{}{}", child_indent, connector);
+                let next_child_indent = format!("{}{}", child_indent, next_indent);
+                prop_to_tree(child, name, &next_line_prefix, &next_child_indent, max_depth, depth + 1, out);
+            }
+        } else if !children.is_empty() {
+            out.push('\n');
+            out.push_str(child_indent);
+            out.push_str(&format!("  ... ({} children)", children.len()));
+        }
+    }
+}
+
 // ── Directory helpers ────────────────────────────────────────────────
 
 fn find_image_entry<'a>(dir: &'a WzDirectoryEntry, path: &str) -> Option<&'a WzImageEntry> {
@@ -173,14 +315,15 @@ fn parse_image_at(
     parse_wz_image(&mut reader).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
-// Populate all images in the directory with their properties (for save).
-// Uses cached (possibly modified) properties when available, otherwise parses from raw.
-fn populate_directory(
+// Prepare all images for save.
+//
+// Modified images (present in `cache`) get their properties set so `generate_data`
+// re-serialises them. Unmodified images get `raw_data` set to the original bytes
+// from `raw`, letting `generate_data` copy them verbatim — no re-parse, no
+// re-serialise.
+fn populate_directory_fast(
     dir: &mut WzDirectoryEntry,
     raw: &[u8],
-    default_iv: [u8; 4],
-    version_hash: u32,
-    header: &WzHeader,
     cache: &HashMap<String, Arc<RwLock<Vec<(String, WzProperty)>>>>,
     prefix: &str,
 ) -> PyResult<()> {
@@ -190,13 +333,24 @@ fn populate_directory(
         } else {
             format!("{}/{}", prefix, img.name)
         };
-        let iv = img.iv.unwrap_or(default_iv);
 
-        img.properties = Some(if let Some(cached) = cache.get(&full_path) {
-            cached.read().map_err(|_| lock_err())?.clone()
+        if let Some(cached) = cache.get(&full_path) {
+            img.properties = Some(cached.read().map_err(|_| lock_err())?.clone());
+            img.raw_data = None;
         } else {
-            parse_image_at(raw, iv, version_hash, img.offset, header)?
-        });
+            // Unmodified: slice original bytes directly (O(size) copy, no parsing).
+            let start = img.offset as usize;
+            let size  = img.size.max(0) as usize;
+            let end   = start.saturating_add(size);
+            if end > raw.len() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Image '{}': offset {} + size {} exceeds file length {}",
+                    img.name, start, size, raw.len()
+                )));
+            }
+            img.properties = None;
+            img.raw_data = Some(raw[start..end].to_vec());
+        }
     }
 
     for sub in dir.subdirectories.iter_mut() {
@@ -205,7 +359,7 @@ fn populate_directory(
         } else {
             format!("{}/{}", prefix, sub.name)
         };
-        populate_directory(sub, raw, default_iv, version_hash, header, cache, &sub_prefix)?;
+        populate_directory_fast(sub, raw, cache, &sub_prefix)?;
     }
 
     Ok(())
@@ -452,6 +606,37 @@ impl WzNode {
         }
     }
 
+    /// Serialise this node and its subtree as a compact JSON string.
+    /// Matches the _node_to_dict format: {path, type, value?, children?}.
+    /// `max_depth`: -1 = unlimited, 0 = this node only (no children).
+    /// One read-lock for the entire traversal — much faster than per-node Python calls.
+    #[pyo3(signature = (max_depth = -1))]
+    fn to_json(&self, max_depth: i32) -> PyResult<String> {
+        let root = self.root.read().map_err(|_| lock_err())?;
+        let parts = self.path_parts_ref();
+        let prop = get_prop(&root, &parts)
+            .ok_or_else(|| PyKeyError::new_err(self.path.join("/")))?;
+        let path_str = self.path.join("/");
+        let mut out = String::new();
+        prop_to_json(prop, &path_str, max_depth, 0, &mut out);
+        Ok(out)
+    }
+
+    /// Format this node and its subtree as a human-readable tree string.
+    /// `max_depth`: -1 = unlimited, 0 = this node only.
+    /// One read-lock for the entire traversal.
+    #[pyo3(signature = (max_depth = -1))]
+    fn to_tree_str(&self, max_depth: i32) -> PyResult<String> {
+        let root = self.root.read().map_err(|_| lock_err())?;
+        let parts = self.path_parts_ref();
+        let prop = get_prop(&root, &parts)
+            .ok_or_else(|| PyKeyError::new_err(self.path.join("/")))?;
+        let label = self.path.last().map(|s| s.as_str()).unwrap_or("root");
+        let mut out = String::new();
+        prop_to_tree(prop, label, "", "", max_depth, 0, &mut out);
+        Ok(out)
+    }
+
     /// The slash-joined path from the image root, e.g. "info/hp".
     #[getter]
     fn path(&self) -> String {
@@ -644,6 +829,35 @@ impl WzImage {
             .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
+    /// Serialise all root nodes as a compact JSON object `{name: {path,type,...}}`.
+    /// One read-lock for the entire traversal.
+    #[pyo3(signature = (max_depth = -1))]
+    fn to_json(&self, max_depth: i32) -> PyResult<String> {
+        let root = self.props.read().map_err(|_| lock_err())?;
+        let mut out = String::from("{");
+        for (i, (name, prop)) in root.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            out.push_str(&json_string(name));
+            out.push(':');
+            prop_to_json(prop, name, max_depth, 0, &mut out);
+        }
+        out.push('}');
+        Ok(out)
+    }
+
+    /// Format all root nodes as a human-readable tree string.
+    /// One read-lock for the entire traversal.
+    #[pyo3(signature = (max_depth = -1))]
+    fn to_tree_str(&self, max_depth: i32) -> PyResult<String> {
+        let root = self.props.read().map_err(|_| lock_err())?;
+        let mut out = String::new();
+        for (i, (name, prop)) in root.iter().enumerate() {
+            if i > 0 { out.push('\n'); }
+            prop_to_tree(prop, name, "", "", max_depth, 0, &mut out);
+        }
+        Ok(out)
+    }
+
     fn __repr__(&self) -> String {
         let count = self.props.read().map(|r| r.len()).unwrap_or(0);
         format!("WzImage({} root nodes)", count)
@@ -776,18 +990,12 @@ impl PyWzFile {
     fn build_bytes_internal(&self) -> PyResult<Vec<u8>> {
         let mut guard = self.inner.lock().map_err(|_| lock_err())?;
         let raw = Arc::clone(&guard.raw);
-        let iv = guard.wz.iv;
-        let version_hash = guard.wz.version_hash;
-        let header = guard.wz.header.clone();
 
         // Borrow split: &mut wz.directory and &image_cache are different fields.
         let inner = &mut *guard;
-        populate_directory(
+        populate_directory_fast(
             &mut inner.wz.directory,
             &raw,
-            iv,
-            version_hash,
-            &header,
             &inner.image_cache,
             "",
         )?;

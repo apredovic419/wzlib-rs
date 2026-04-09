@@ -60,92 +60,6 @@ def _resolve_path(wz, img, node_path: str):
         return img, node
 
 
-def _node_to_dict(node: WzNode, depth: int = 0, max_depth: int = -1) -> dict:
-    """Convert a WzNode to a JSON-friendly dict."""
-    result = {
-        "path": node.path,
-        "type": node.node_type(),
-    }
-
-    # Add value for leaf types
-    ntype = node.node_type()
-    if ntype in ("Short", "Int", "Long"):
-        result["value"] = node.as_int()
-    elif ntype in ("Float", "Double"):
-        result["value"] = node.as_float()
-    elif ntype in ("String", "UOL"):
-        result["value"] = node.as_str()
-    elif ntype == "Null":
-        result["value"] = None
-    elif ntype == "Canvas":
-        result["value"] = "(canvas image)"
-    elif ntype == "Sound":
-        result["value"] = "(audio data)"
-    elif ntype == "Vector":
-        result["value"] = "(vector)"
-    elif ntype == "Lua":
-        result["value"] = "(lua bytecode)"
-    elif ntype == "RawData":
-        result["value"] = "(raw data)"
-    elif ntype == "Video":
-        result["value"] = "(video data)"
-
-    children = node.children()
-    if children and (max_depth < 0 or depth < max_depth):
-        result["children"] = {}
-        for name in children:
-            child = node.get(name)
-            if child is not None:
-                result["children"][name] = _node_to_dict(child, depth + 1, max_depth)
-
-    elif children:
-        result["children_count"] = len(children)
-
-    return result
-
-
-def _format_node_tree(node: WzNode, prefix: str = "", depth: int = 0, max_depth: int = -1) -> str:
-    """Format a node as a human-readable tree."""
-    lines = []
-    ntype = node.node_type()
-
-    # Value summary
-    val = ""
-    if ntype in ("Short", "Int", "Long"):
-        val = f" = {node.as_int()}"
-    elif ntype in ("Float", "Double"):
-        val = f" = {node.as_float()}"
-    elif ntype in ("String", "UOL"):
-        s = node.as_str()
-        if s and len(s) > 60:
-            s = s[:57] + "..."
-        val = f' = "{s}"'
-    elif ntype == "Null":
-        val = " = null"
-
-    # Use the last path component as label
-    label = node.path.rsplit("/", 1)[-1] if "/" in node.path else node.path
-    lines.append(f"{prefix}{label} [{ntype}]{val}")
-
-    children = node.children()
-    if children and (max_depth < 0 or depth < max_depth):
-        for i, name in enumerate(children):
-            child = node.get(name)
-            if child is not None:
-                is_last = (i == len(children) - 1)
-                child_prefix = prefix + ("  " if is_last else "│ ")
-                connector = "└─" if is_last else "├─"
-                sub = _format_node_tree(child, child_prefix, depth + 1, max_depth)
-                # Replace first line prefix
-                sub_lines = sub.split("\n")
-                sub_lines[0] = prefix + connector + sub_lines[0][len(child_prefix):]
-                lines.extend(sub_lines)
-    elif children:
-        lines.append(f"{prefix}  ... ({len(children)} children)")
-
-    return "\n".join(lines)
-
-
 def _parse_value(value_str: str, type_hint: str = None):
     """Parse a string value into the appropriate Python type."""
     if type_hint:
@@ -273,7 +187,7 @@ def cmd_tree(args):
 
     if wz is not None:
         if not args.path:
-            # Show top-level directory tree
+            # Show top-level directory tree (image names only)
             images = wz.list_images()
             if args.json:
                 print(json.dumps([{"name": n, "type": "Image"} for n in images], indent=2))
@@ -292,54 +206,26 @@ def cmd_tree(args):
             if node is None:
                 print(f"Error: path not found: {args.path}", file=sys.stderr)
                 return 1
+            _print_tree(node, args)
         else:
-            # Show full image tree — create a virtual representation
-            children = img_obj.children()
-            if args.json:
-                result = {}
-                for name in children:
-                    n = img_obj.get(name)
-                    if n:
-                        result[name] = _node_to_dict(n, 0, args.depth)
-                print(json.dumps(result, indent=2))
-            else:
-                for i, name in enumerate(children):
-                    n = img_obj.get(name)
-                    if n:
-                        tree = _format_node_tree(n, "", 0, args.depth)
-                        print(tree)
-            return
+            _print_tree(img_obj, args)
     else:
         if args.path:
             node = img.get(args.path)
             if node is None:
                 print(f"Error: path not found: {args.path}", file=sys.stderr)
                 return 1
-            if args.json:
-                print(json.dumps(_node_to_dict(node, 0, args.depth), indent=2))
-            else:
-                print(_format_node_tree(node, "", 0, args.depth))
-            return
+            _print_tree(node, args)
         else:
-            children = img.children()
-            if args.json:
-                result = {}
-                for name in children:
-                    n = img.get(name)
-                    if n:
-                        result[name] = _node_to_dict(n, 0, args.depth)
-                print(json.dumps(result, indent=2))
-            else:
-                for name in children:
-                    n = img.get(name)
-                    if n:
-                        print(_format_node_tree(n, "", 0, args.depth))
-            return
+            _print_tree(img, args)
 
+
+def _print_tree(obj, args):
+    """Print a WzNode or WzImage as tree or JSON using Rust-side traversal."""
     if args.json:
-        print(json.dumps(_node_to_dict(node, 0, args.depth), indent=2))
+        print(json.dumps(json.loads(obj.to_json(args.depth)), indent=2))
     else:
-        print(_format_node_tree(node, "", 0, args.depth))
+        print(obj.to_tree_str(args.depth))
 
 
 def cmd_get(args):

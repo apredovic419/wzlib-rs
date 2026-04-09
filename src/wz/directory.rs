@@ -33,6 +33,11 @@ pub struct WzImageEntry {
     pub offset: u64,
     #[serde(skip)]
     pub properties: Option<Vec<(String, WzProperty)>>,
+    /// Pre-serialized image bytes. When set by the Python bindings for
+    /// unmodified images, `generate_data` copies these directly instead
+    /// of re-parsing + re-serializing the original file bytes.
+    #[serde(skip)]
+    pub raw_data: Option<Vec<u8>>,
     /// Per-image IV detected during parsing (hybrid WZ files may encrypt
     /// different images with different keys). Falls back to the directory
     /// IV when `None`.
@@ -144,6 +149,7 @@ impl WzDirectoryEntry {
                     checksum: entry.checksum,
                     offset: entry.offset,
                     properties: None,
+                    raw_data: None,
                     iv: None,
                 };
                 dir.images.push(img);
@@ -193,8 +199,13 @@ impl WzDirectoryEntry {
                 img.checksum = compute_image_checksum(&serialized);
                 img.size = serialized.len() as i32;
                 image_data_buf.extend_from_slice(&serialized);
+            } else if let Some(raw) = img.raw_data.take() {
+                // Pre-serialized bytes from the Python layer (unmodified image fast-path).
+                img.checksum = compute_image_checksum(&raw);
+                img.size = raw.len() as i32;
+                image_data_buf.extend_from_slice(&raw);
             }
-            // If properties is None, image retains its existing size/checksum
+            // If both are None, image retains its existing size/checksum (no bytes written).
         }
 
         for subdir in &mut self.subdirectories {
@@ -573,12 +584,14 @@ mod tests {
 
         let mut sub_a = WzDirectoryEntry::new("a".into(), WzDirectoryType::Directory as u8);
         sub_a.images.push(WzImageEntry {
-            name: "0.img".into(), size: 100, checksum: 10, offset: 0, properties: None, iv: None,
+            name: "0.img".into(), size: 100, checksum: 10, offset: 0,
+            properties: None, raw_data: None, iv: None,
         });
 
         let mut sub_b = WzDirectoryEntry::new("b".into(), WzDirectoryType::Directory as u8);
         sub_b.images.push(WzImageEntry {
-            name: "0.img".into(), size: 200, checksum: 20, offset: 0, properties: None, iv: None,
+            name: "0.img".into(), size: 200, checksum: 20, offset: 0,
+            properties: None, raw_data: None, iv: None,
         });
 
         root.subdirectories.push(sub_a);

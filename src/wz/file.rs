@@ -565,6 +565,7 @@ mod tests {
             checksum: 0,
             offset: 0,
             properties: Some(img_props),
+            raw_data: None,
             iv: None,
         });
 
@@ -627,7 +628,7 @@ mod tests {
         // a gap of zero bytes between directory tables and image data.
         let make_img = |name: &str, props: Vec<(String, WzProperty)>| WzImageEntry {
             name: name.into(), size: 0, checksum: 0, offset: 0,
-            properties: Some(props), iv: None,
+            properties: Some(props), raw_data: None, iv: None,
         };
 
         let mut sub_a = WzDirectoryEntry::new("skillA".into(), WzDirectoryType::Directory as u8);
@@ -712,13 +713,13 @@ mod tests {
         dir.images.push(WzImageEntry {
             name: "gms.img".into(),
             size: 0, checksum: 0, offset: 0,
-            properties: Some(props_a),
+            properties: Some(props_a), raw_data: None,
             iv: Some(WZ_GMSIV),
         });
         dir.images.push(WzImageEntry {
             name: "bms.img".into(),
             size: 0, checksum: 0, offset: 0,
-            properties: Some(props_b),
+            properties: Some(props_b), raw_data: None,
             iv: None, // falls back to directory IV (BMS)
         });
 
