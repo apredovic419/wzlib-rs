@@ -561,3 +561,107 @@ class TestErrorHandling:
         node = img.get("intVal")
         # This should work
         assert node.node_type() == "Int"
+
+
+# ── XML export / import ───────────────────────────────────────────────────────
+
+
+class TestXmlExport:
+    """Tests for WzImage.to_xml() and WzImage.from_xml()."""
+
+    def test_to_xml_server_mode(self, sample_image_with_properties):
+        """Server mode XML has no basedata attributes."""
+        img = WzImage.from_bytes(sample_image_with_properties)
+        xml = img.to_xml(mode="server")
+        assert "<?xml" in xml
+        assert '<imgdir name="root">' in xml
+        assert 'name="intVal"' in xml
+        assert "basedata" not in xml
+
+    def test_to_xml_client_mode_matches_server_for_scalars(self, sample_image_with_properties):
+        """Client mode for scalar-only images matches server mode (no binary)."""
+        img = WzImage.from_bytes(sample_image_with_properties)
+        xml_server = img.to_xml(mode="server")
+        xml_client = img.to_xml(mode="client")
+        # Both should have the same int/string/float nodes
+        assert 'name="intVal"' in xml_client
+        assert 'name="strVal"' in xml_client
+
+    def test_to_xml_default_mode_is_server(self, sample_image_with_properties):
+        """Default mode should be server (no basedata)."""
+        img = WzImage.from_bytes(sample_image_with_properties)
+        xml = img.to_xml()
+        assert "basedata" not in xml
+
+    def test_roundtrip_server_mode(self, sample_image_with_properties):
+        """Export to XML and import back — scalar values preserved."""
+        img = WzImage.from_bytes(sample_image_with_properties)
+        xml = img.to_xml(mode="server", name="test.img")
+        img2 = WzImage.from_xml(xml)
+        assert img2 is not None
+        node = img2.get("intVal")
+        assert node is not None
+        assert node.as_int() == 42
+
+    def test_from_xml_parses_string(self, sample_image_with_properties):
+        """from_xml correctly parses string properties."""
+        img = WzImage.from_bytes(sample_image_with_properties)
+        xml = img.to_xml(mode="server", name="test.img")
+        img2 = WzImage.from_xml(xml)
+        node = img2.get("strVal")
+        assert node is not None
+        assert node.as_str() == "hello"
+
+    def test_from_xml_invalid_raises(self):
+        """from_xml raises RuntimeError on malformed XML."""
+        with pytest.raises(RuntimeError):
+            WzImage.from_xml("not xml at all <<<")
+
+    def test_to_xml_named(self, sample_image_with_properties):
+        """to_xml with name argument uses correct root name."""
+        img = WzImage.from_bytes(sample_image_with_properties)
+        xml = img.to_xml(name="myimg.img")
+        assert 'name="myimg.img"' in xml
+
+    def test_to_xml_escape(self, sample_hotfix_bytes):
+        """XML special characters in property names/values are escaped."""
+        img = WzImage.from_bytes(sample_hotfix_bytes)
+        img.add("a&b", '<val">')
+        xml = img.to_xml()
+        assert "a&amp;b" in xml
+        assert "&lt;val&quot;&gt;" in xml
+
+
+# ── JSON base64 export ────────────────────────────────────────────────────────
+
+
+class TestJsonBase64:
+    """Tests for to_json_base64() on WzImage and WzNode."""
+
+    def test_image_to_json_base64_returns_string(self, sample_image_with_properties):
+        """to_json_base64() returns a JSON object keyed by property name."""
+        import json
+        img = WzImage.from_bytes(sample_image_with_properties)
+        j = img.to_json_base64()
+        parsed = json.loads(j)
+        assert isinstance(parsed, dict)
+
+    def test_image_to_json_base64_contains_scalars(self, sample_image_with_properties):
+        """to_json_base64() includes scalar properties keyed by name."""
+        import json
+        img = WzImage.from_bytes(sample_image_with_properties)
+        j = img.to_json_base64()
+        parsed = json.loads(j)
+        assert "intVal" in parsed
+        assert "strVal" in parsed
+        assert parsed["intVal"]["value"] == 42
+
+    def test_node_to_json_base64(self, sample_image_with_properties):
+        """WzNode.to_json_base64() returns a single-node JSON object."""
+        import json
+        img = WzImage.from_bytes(sample_image_with_properties)
+        node = img.get("intVal")
+        j = node.to_json_base64()
+        parsed = json.loads(j)
+        assert parsed["type"] == "Int"
+        assert parsed["value"] == 42

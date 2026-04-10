@@ -121,6 +121,76 @@ export class WzParser {
     return JSON.parse(json);
   }
 
+  // ── Base64 JSON variants ──────────────────────────────────────────
+
+  /** Like `parseImage` but binary properties include `base64Data` instead of `dataLength`. */
+  parseImageBase64(
+    data: Uint8Array,
+    version: WzMapleVersion,
+    imgOffset: number,
+    imgSize: number,
+    versionHash: number,
+    customIv?: Uint8Array,
+  ): WzPropertyNode[] {
+    const json = this.wasm.parseWzImageBase64(data, version, imgOffset, imgSize, versionHash, customIv);
+    return JSON.parse(json);
+  }
+
+  /** Like `parseHotfixFile` but binary properties include `base64Data`. */
+  parseHotfixFileBase64(
+    data: Uint8Array,
+    version: WzMapleVersion,
+    customIv?: Uint8Array,
+  ): WzPropertyNode[] {
+    const json = this.wasm.parseHotfixDataWzBase64(data, version, customIv);
+    return JSON.parse(json);
+  }
+
+  // ── XML export / import ───────────────────────────────────────────
+
+  /**
+   * Export a WZ image as WZ XML string.
+   * @param serverMode - if true (default), binary data (Canvas pixels, Sound, etc.) is omitted.
+   *   If false, binary data is base64-encoded in `basedata` attributes.
+   */
+  exportImageXml(
+    data: Uint8Array,
+    version: WzMapleVersion,
+    imgOffset: number,
+    imgSize: number,
+    versionHash: number,
+    imgName: string,
+    serverMode: boolean = true,
+    customIv?: Uint8Array,
+  ): string {
+    return this.wasm.exportWzImageXml(
+      data, version, imgOffset, imgSize, versionHash, imgName, serverMode, customIv
+    );
+  }
+
+  /**
+   * Export a hotfix Data.wz as WZ XML string.
+   * @param serverMode - if true (default), binary data is omitted.
+   */
+  exportHotfixXml(
+    data: Uint8Array,
+    version: WzMapleVersion,
+    imgName: string,
+    serverMode: boolean = true,
+    customIv?: Uint8Array,
+  ): string {
+    return this.wasm.exportHotfixXml(data, version, imgName, serverMode, customIv);
+  }
+
+  /**
+   * Import a WZ XML string and return an editable image (same format as `parseImageForEdit`).
+   * The result can be passed directly to `buildImage` after modification.
+   */
+  importXml(xml: string): EditableImage {
+    const packed = this.wasm.importWzImageXml(xml);
+    return unpackEditResult(packed);
+  }
+
   // ── Image parsing ────────────────────────────────────────────────
 
   /** Parse a WZ image at a given offset, returning its property tree. */

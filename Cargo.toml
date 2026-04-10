@@ -27,6 +27,9 @@ aes = "0.8"
 cipher = "0.4"
 thiserror = "2"
 texture2ddecoder = "0.1"
+base64 = "0.22"
+quick-xml = "0.37"
+png = "0.17"
 
 [dependencies.web-sys]
 version = "0.3"

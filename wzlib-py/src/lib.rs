@@ -35,6 +35,16 @@ fn version_to_iv(version: &str) -> PyResult<[u8; 4]> {
     Ok(version_to_maple(version)?.iv())
 }
 
+fn parse_xml_mode(mode: &str) -> PyResult<wzlib_rs::XmlMode> {
+    match mode.to_lowercase().as_str() {
+        "server" | "metadata" | "metadataonly" => Ok(wzlib_rs::XmlMode::MetadataOnly),
+        "client" | "full" | "withbinarydata" => Ok(wzlib_rs::XmlMode::WithBinaryData),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown XML mode '{}'. Use 'server' or 'client'.", other
+        ))),
+    }
+}
+
 fn prop_type_name(prop: &WzProperty) -> &'static str {
     match prop {
         WzProperty::Null => "Null",
@@ -190,6 +200,107 @@ fn prop_to_json(
                         format!("{}/{}", path_str, name)
                     };
                     prop_to_json(child, &child_path, max_depth, depth + 1, out);
+                }
+                out.push('}');
+            } else {
+                out.push_str(",\"children_count\":");
+                out.push_str(&children.len().to_string());
+            }
+        }
+    }
+
+    out.push('}');
+}
+
+// Recursively serialise a WzProperty as JSON with binary data base64-encoded.
+// Binary properties (Canvas, Sound, Lua, RawData, Video) emit a "base64Data" field.
+fn prop_to_json_b64(
+    prop: &WzProperty,
+    path_str: &str,
+    max_depth: i32,
+    depth: i32,
+    out: &mut String,
+) {
+    use base64::Engine as _;
+
+    let type_name = prop_type_name(prop);
+    out.push('{');
+    out.push_str("\"path\":");
+    out.push_str(&json_string(path_str));
+    out.push_str(",\"type\":");
+    out.push_str(&json_string(type_name));
+
+    match prop {
+        WzProperty::Short(v)  => { out.push_str(",\"value\":"); out.push_str(&v.to_string()); }
+        WzProperty::Int(v)    => { out.push_str(",\"value\":"); out.push_str(&v.to_string()); }
+        WzProperty::Long(v)   => { out.push_str(",\"value\":"); out.push_str(&v.to_string()); }
+        WzProperty::Float(v)  => {
+            out.push_str(",\"value\":");
+            if v.is_finite() { out.push_str(&v.to_string()); } else { out.push_str("null"); }
+        }
+        WzProperty::Double(v) => {
+            out.push_str(",\"value\":");
+            if v.is_finite() { out.push_str(&v.to_string()); } else { out.push_str("null"); }
+        }
+        WzProperty::String(s) | WzProperty::Uol(s) => {
+            out.push_str(",\"value\":");
+            out.push_str(&json_string(s));
+        }
+        WzProperty::Null => { out.push_str(",\"value\":null"); }
+        WzProperty::Canvas { width, height, format, png_data, .. } => {
+            out.push_str(",\"width\":");
+            out.push_str(&width.to_string());
+            out.push_str(",\"height\":");
+            out.push_str(&height.to_string());
+            out.push_str(",\"format\":");
+            out.push_str(&format.format_id().to_string());
+            out.push_str(",\"base64Data\":");
+            out.push_str(&json_string(
+                &base64::engine::general_purpose::STANDARD.encode(png_data)
+            ));
+        }
+        WzProperty::Sound { data, header, duration_ms } => {
+            out.push_str(",\"duration_ms\":");
+            out.push_str(&duration_ms.to_string());
+            // Pack header + audio in same format as the WASM pack_sound_blob
+            let mut blob = Vec::with_capacity(4 + header.len() + data.len());
+            blob.extend_from_slice(&(header.len() as u32).to_le_bytes());
+            blob.extend_from_slice(header);
+            blob.extend_from_slice(data);
+            out.push_str(",\"base64Data\":");
+            out.push_str(&json_string(
+                &base64::engine::general_purpose::STANDARD.encode(&blob)
+            ));
+        }
+        WzProperty::Lua(data) => {
+            out.push_str(",\"base64Data\":");
+            out.push_str(&json_string(
+                &base64::engine::general_purpose::STANDARD.encode(data)
+            ));
+        }
+        WzProperty::RawData { data, .. } => {
+            out.push_str(",\"base64Data\":");
+            out.push_str(&json_string(
+                &base64::engine::general_purpose::STANDARD.encode(data)
+            ));
+        }
+        _ => {}
+    }
+
+    if let Some(children) = prop_children(prop) {
+        if !children.is_empty() {
+            if max_depth < 0 || depth < max_depth {
+                out.push_str(",\"children\":{");
+                for (i, (name, child)) in children.iter().enumerate() {
+                    if i > 0 { out.push(','); }
+                    out.push_str(&json_string(name));
+                    out.push(':');
+                    let child_path = if path_str.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", path_str, name)
+                    };
+                    prop_to_json_b64(child, &child_path, max_depth, depth + 1, out);
                 }
                 out.push('}');
             } else {
@@ -622,6 +733,36 @@ impl WzNode {
         Ok(out)
     }
 
+    /// Like `to_json()` but binary properties (Canvas, Sound, Lua, etc.) include
+    /// `"base64Data"` with the raw data base64-encoded.
+    #[pyo3(signature = (max_depth = -1))]
+    fn to_json_base64(&self, max_depth: i32) -> PyResult<String> {
+        let root = self.root.read().map_err(|_| lock_err())?;
+        let parts = self.path_parts_ref();
+        let prop = get_prop(&root, &parts)
+            .ok_or_else(|| PyKeyError::new_err(self.path.join("/")))?;
+        let path_str = self.path.join("/");
+        let mut out = String::new();
+        prop_to_json_b64(prop, &path_str, max_depth, 0, &mut out);
+        Ok(out)
+    }
+
+    /// Export this node and its subtree as WZ XML.
+    /// `mode`: `"server"` (metadata only, no binary data) or `"client"` (base64 binary).
+    #[pyo3(signature = (mode = "server"))]
+    fn to_xml(&self, mode: &str) -> PyResult<String> {
+        use wzlib_rs::export_wz_xml;
+        let xml_mode = parse_xml_mode(mode)?;
+        let root = self.root.read().map_err(|_| lock_err())?;
+        let parts = self.path_parts_ref();
+        let prop = get_prop(&root, &parts)
+            .ok_or_else(|| PyKeyError::new_err(self.path.join("/")))?;
+        let node_name = self.path.last().cloned().unwrap_or_default();
+        // Export the children of this node as root-level items
+        let children = prop_children(prop).unwrap_or(&[]);
+        Ok(export_wz_xml(&node_name, children, &xml_mode))
+    }
+
     /// Format this node and its subtree as a human-readable tree string.
     /// `max_depth`: -1 = unlimited, 0 = this node only.
     /// One read-lock for the entire traversal.
@@ -843,6 +984,46 @@ impl WzImage {
         }
         out.push('}');
         Ok(out)
+    }
+
+    /// Like `to_json()` but binary properties (Canvas, Sound, Lua, etc.) include
+    /// `"base64Data"` with the raw data base64-encoded.
+    #[pyo3(signature = (max_depth = -1))]
+    fn to_json_base64(&self, max_depth: i32) -> PyResult<String> {
+        let root = self.props.read().map_err(|_| lock_err())?;
+        let mut out = String::from("{");
+        for (i, (name, prop)) in root.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            out.push_str(&json_string(name));
+            out.push(':');
+            prop_to_json_b64(prop, name, max_depth, 0, &mut out);
+        }
+        out.push('}');
+        Ok(out)
+    }
+
+    /// Export all root nodes as WZ XML.
+    /// `mode`: `"server"` (metadata only, no binary data) or `"client"` (base64 binary).
+    /// Uses `"root"` as the root `<imgdir>` element name.
+    /// To use a specific image name, pass `name` explicitly via `to_xml_named()`.
+    #[pyo3(signature = (mode = "server", name = "root"))]
+    fn to_xml(&self, mode: &str, name: &str) -> PyResult<String> {
+        use wzlib_rs::export_wz_xml;
+        let xml_mode = parse_xml_mode(mode)?;
+        let root = self.props.read().map_err(|_| lock_err())?;
+        Ok(export_wz_xml(name, &root, &xml_mode))
+    }
+
+    /// Parse an XML string and create a new WzImage.
+    /// `version`: encryption version for subsequent save operations (`"bms"`, `"gms"`, `"ems"`).
+    #[staticmethod]
+    #[pyo3(signature = (xml, version = "bms"))]
+    fn from_xml(xml: &str, version: &str) -> PyResult<Self> {
+        use wzlib_rs::import_wz_xml;
+        let iv = version_to_iv(version)?;
+        let (_name, props) = import_wz_xml(xml)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { props: Arc::new(RwLock::new(props)), iv })
     }
 
     /// Format all root nodes as a human-readable tree string.

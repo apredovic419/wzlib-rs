@@ -83,6 +83,28 @@ wzltool extract <file> <path> -o output.png
 wzltool extract <file> <path> -o output.mp3
 ```
 
+### XML export / import
+
+```bash
+# Export entire image to WZ XML (server mode — metadata only, no binary data)
+wzltool xml <file>                          # prints to stdout
+wzltool xml <file> -o output.xml            # writes to file
+wzltool xml Character.wz "00002000.img" -o 00002000.img.xml
+
+# Export a subtree
+wzltool xml Character.wz "00002000.img/walk1" -o walk1.xml
+
+# Client mode — includes base64-encoded binary data (Canvas pixels, Sound, Lua, etc.)
+wzltool xml <file> --mode client -o output.xml
+
+# Import XML back to IMG
+wzltool xml-import output.xml -o rebuilt.img
+```
+
+- `--mode server` (default): metadata only — no binary data. Suitable for server tools.
+- `--mode client`: binary data base64-encoded in `basedata` attributes. Enables round-trip.
+- The XML format matches the WzLib/HaRepacker convention used by server emulators.
+
 ### JSON mode
 
 Add `--json` before the subcommand for machine-readable output. All commands support it.

@@ -417,6 +417,65 @@ def cmd_rm(args):
         print(f"Saved to: {output}")
 
 
+def cmd_xml(args):
+    """Export a WZ/IMG file (or subtree) as WZ XML."""
+    wz, img = _open(args.file, args.version)
+    mode = args.mode  # "server" or "client"
+
+    if wz is not None:
+        if not args.path:
+            print("Error: --path required when exporting from a .wz file", file=sys.stderr)
+            return 1
+        parts = args.path.split("/", 1)
+        image_name = parts[0]
+        prop_path = parts[1] if len(parts) > 1 else ""
+        img_obj = wz.image(image_name)
+        if prop_path:
+            node = img_obj.get(prop_path)
+            if node is None:
+                print(f"Error: path not found: {args.path}", file=sys.stderr)
+                return 1
+            xml_str = node.to_xml(mode)
+        else:
+            xml_str = img_obj.to_xml(mode, image_name)
+    else:
+        if args.path:
+            node = img.get(args.path)
+            if node is None:
+                print(f"Error: path not found: {args.path}", file=sys.stderr)
+                return 1
+            xml_str = node.to_xml(mode)
+        else:
+            # Use filename as the root element name
+            img_name = os.path.basename(args.file)
+            xml_str = img.to_xml(mode, img_name)
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(xml_str)
+        if args.json:
+            print(json.dumps({"status": "ok", "output": args.output}))
+        else:
+            print(f"XML exported to: {args.output}")
+    else:
+        print(xml_str)
+
+
+def cmd_xml_import(args):
+    """Import an XML file and save as WZ IMG."""
+    with open(args.xml_file, encoding="utf-8") as f:
+        xml_str = f.read()
+
+    img = WzImage.from_xml(xml_str, version=args.version)
+    output = args.output or (os.path.splitext(args.xml_file)[0] + ".img")
+    img.save(output)
+
+    if args.json:
+        print(json.dumps({"status": "ok", "output": output}))
+    else:
+        print(f"Saved to: {output}")
+
+
 def cmd_extract(args):
     """Extract canvas image or sound data."""
     wz, img = _open(args.file, args.version)
@@ -542,6 +601,19 @@ def main():
     p.add_argument("path", help="Path to Canvas or Sound node")
     p.add_argument("--output", "-o", help="Output file path")
 
+    # xml
+    p = sub.add_parser("xml", help="Export WZ/IMG to WZ XML format")
+    p.add_argument("file", help="WZ or IMG file path")
+    p.add_argument("path", nargs="?", default="", help="Subtree path to export (optional)")
+    p.add_argument("--mode", "-m", default="server", choices=["server", "client"],
+                   help="Export mode: server (metadata only) or client (with base64 binary data)")
+    p.add_argument("--output", "-o", help="Output XML file (default: stdout)")
+
+    # xml-import
+    p = sub.add_parser("xml-import", help="Import WZ XML and save as IMG")
+    p.add_argument("xml_file", help="XML file to import")
+    p.add_argument("--output", "-o", help="Output IMG file (default: <xml_file>.img)")
+
     args = parser.parse_args()
 
     try:
@@ -554,6 +626,8 @@ def main():
             "add": cmd_add,
             "rm": cmd_rm,
             "extract": cmd_extract,
+            "xml": cmd_xml,
+            "xml-import": cmd_xml_import,
         }[args.command]
         result = func(args)
         sys.exit(result or 0)

@@ -11,6 +11,8 @@ crate-type = ["cdylib"]
 [dependencies]
 wzlib-rs = { path = ".." }
 pyo3 = { version = "0.28", features = ["extension-module"] }
+base64 = "0.22"
+png = "0.17"
 
 [profile.release]
 lto = true

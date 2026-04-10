@@ -20,3 +20,4 @@ pub use wz::header::WzHeader;
 pub use wz::error::WzError;
 pub use image::{decode_pixels, decompress_png_data};
 pub use image::encode::{encode_pixels, compress_png_data};
+pub use wz::xml::{XmlMode, export_wz_xml, import_wz_xml};

@@ -32,6 +32,7 @@ pub mod mcv;
 pub mod ms_file;
 pub mod properties;
 pub mod types;
+pub mod xml;
 
 #[cfg(test)]
 pub(crate) mod test_utils;

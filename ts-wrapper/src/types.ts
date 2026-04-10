@@ -71,6 +71,8 @@ export interface WzPropertyNode {
   videoType?: number;
   mcv?: McvHeaderInfo;
   blobIndex?: number;
+  // Base64 variants (from parseWzImageBase64 / parseHotfixDataWzBase64)
+  base64Data?: string;
 }
 
 export interface EditableImage {
@@ -143,6 +145,38 @@ export interface WasmExports {
   detectWzFileType(data: Uint8Array): WzFileType;
   parseWzListFile(data: Uint8Array, versionName: string, customIv?: Uint8Array): string;
   parseHotfixDataWz(data: Uint8Array, versionName: string, customIv?: Uint8Array): string;
+  /** Like parseWzImage but binary props include `base64Data` instead of `dataLength`. */
+  parseWzImageBase64(
+    data: Uint8Array,
+    versionName: string,
+    imgOffset: number,
+    imgSize: number,
+    versionHash: number,
+    customIv?: Uint8Array,
+  ): string;
+  /** Like parseHotfixDataWz but binary props include `base64Data`. */
+  parseHotfixDataWzBase64(data: Uint8Array, versionName: string, customIv?: Uint8Array): string;
+  /** Export a WZ image as XML string. serverMode=true omits binary data. */
+  exportWzImageXml(
+    data: Uint8Array,
+    versionName: string,
+    imgOffset: number,
+    imgSize: number,
+    versionHash: number,
+    imgName: string,
+    serverMode: boolean,
+    customIv?: Uint8Array,
+  ): string;
+  /** Export a hotfix Data.wz as XML string. */
+  exportHotfixXml(
+    data: Uint8Array,
+    versionName: string,
+    imgName: string,
+    serverMode: boolean,
+    customIv?: Uint8Array,
+  ): string;
+  /** Import WZ XML and return packed editable binary (same format as parseWzImageForEdit). */
+  importWzImageXml(xml: string): Uint8Array;
   computeVersionHash(version: number): number;
   parseMsFile(data: Uint8Array, fileName: string): string;
   parseMsImage(data: Uint8Array, fileName: string, entryIndex: number): string;

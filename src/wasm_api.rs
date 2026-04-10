@@ -172,6 +172,85 @@ fn children_to_json_inner(
     props.iter().map(|(n, p)| prop_to_json(n, p, blobs.as_deref_mut())).collect()
 }
 
+// Variant that emits "base64Data" for binary properties instead of "dataLength".
+// Used by the *Base64 WASM exports for self-contained JSON output.
+fn prop_to_json_b64(name: &str, prop: &WzProperty) -> serde_json::Value {
+    use base64::Engine as _;
+    use serde_json::json;
+
+    match prop {
+        WzProperty::Null => json!({ "name": name, "type": "Null" }),
+        WzProperty::Short(v)  => json!({ "name": name, "type": "Short",  "value": v }),
+        WzProperty::Int(v)    => json!({ "name": name, "type": "Int",    "value": v }),
+        WzProperty::Long(v)   => json!({ "name": name, "type": "Long",   "value": v }),
+        WzProperty::Float(v)  => json!({ "name": name, "type": "Float",  "value": v }),
+        WzProperty::Double(v) => json!({ "name": name, "type": "Double", "value": v }),
+        WzProperty::String(v) => json!({ "name": name, "type": "String", "value": v }),
+        WzProperty::Uol(v)    => json!({ "name": name, "type": "UOL",    "value": v }),
+        WzProperty::Vector { x, y } => json!({ "name": name, "type": "Vector", "x": x, "y": y }),
+        WzProperty::SubProperty { properties } => {
+            let children: Vec<_> = properties.iter().map(|(n, p)| prop_to_json_b64(n, p)).collect();
+            json!({ "name": name, "type": "SubProperty", "children": children })
+        }
+        WzProperty::Canvas { width, height, format, properties, png_data } => {
+            let children: Vec<_> = properties.iter().map(|(n, p)| prop_to_json_b64(n, p)).collect();
+            json!({
+                "name": name, "type": "Canvas",
+                "width": width, "height": height, "format": format.format_id(),
+                "children": children,
+                "base64Data": base64::engine::general_purpose::STANDARD.encode(png_data),
+            })
+        }
+        WzProperty::Convex { points } => {
+            let pts: Vec<_> = points.iter().map(|(n, p)| prop_to_json_b64(n, p)).collect();
+            json!({ "name": name, "type": "Convex", "children": pts })
+        }
+        WzProperty::Sound { duration_ms, data, header } => {
+            let blob = pack_sound_blob(header, data);
+            json!({
+                "name": name, "type": "Sound", "duration_ms": duration_ms,
+                "base64Data": base64::engine::general_purpose::STANDARD.encode(&blob),
+            })
+        }
+        WzProperty::Lua(data) => {
+            json!({
+                "name": name, "type": "Lua",
+                "base64Data": base64::engine::general_purpose::STANDARD.encode(data),
+            })
+        }
+        WzProperty::RawData { raw_type, properties, data } => {
+            let children: Vec<_> = properties.iter().map(|(n, p)| prop_to_json_b64(n, p)).collect();
+            let mut obj = json!({ "name": name, "type": "RawData", "rawDataType": raw_type });
+            if !children.is_empty() { obj["children"] = json!(children); }
+            obj["base64Data"] = json!(base64::engine::general_purpose::STANDARD.encode(data));
+            obj
+        }
+        WzProperty::Video { video_type, properties, data_length, mcv_header, video_data, .. } => {
+            let children: Vec<_> = properties.iter().map(|(n, p)| prop_to_json_b64(n, p)).collect();
+            let mut obj = json!({
+                "name": name, "type": "Video",
+                "videoType": video_type, "dataLength": data_length, "children": children,
+            });
+            if let Some(vdata) = video_data {
+                obj["base64Data"] = json!(base64::engine::general_purpose::STANDARD.encode(vdata));
+            }
+            if let Some(h) = mcv_header {
+                obj["mcv"] = json!({
+                    "fourcc": h.fourcc, "width": h.width, "height": h.height,
+                    "frameCount": h.frame_count, "dataFlags": h.data_flags,
+                    "frameDelayUnitNs": h.frame_delay_unit_ns.to_string(),
+                    "defaultDelay": h.default_delay,
+                });
+            }
+            obj
+        }
+    }
+}
+
+fn children_to_json_b64(props: &[(String, WzProperty)]) -> Vec<serde_json::Value> {
+    props.iter().map(|(n, p)| prop_to_json_b64(n, p)).collect()
+}
+
 // ── Property tree traversal & extraction ────────────────────────────
 
 fn find_property<'a>(
@@ -442,6 +521,95 @@ pub fn parse_hotfix_data_wz(data: &[u8], version_name: &str, custom_iv: Option<V
     let properties = crate::wz::file::parse_hotfix_data_wz(data, iv)
         .to_js_err()?;
     to_json_string(&children_to_json(&properties))
+}
+
+// ── Base64 JSON variants ────────────────────────────────────────────
+
+/// Like `parseWzImage` but binary properties (Canvas, Sound, Lua, etc.) include
+/// `"base64Data"` with the raw data base64-encoded, instead of `"dataLength"`.
+#[wasm_bindgen(js_name = "parseWzImageBase64")]
+pub fn parse_wz_image_base64(
+    wz_data: &[u8],
+    version_name: &str,
+    img_offset: u32,
+    img_size: u32,
+    version_hash: u32,
+    custom_iv: Option<Vec<u8>>,
+) -> Result<String, JsError> {
+    let _ = img_size;
+    let iv = resolve_iv(version_name, custom_iv)?;
+    let (properties, _) = parse_image_props(wz_data, iv, img_offset, version_hash)?;
+    to_json_string(&children_to_json_b64(&properties))
+}
+
+/// Like `parseHotfixDataWz` but binary properties include `"base64Data"`.
+#[wasm_bindgen(js_name = "parseHotfixDataWzBase64")]
+pub fn parse_hotfix_data_wz_base64(
+    data: &[u8],
+    version_name: &str,
+    custom_iv: Option<Vec<u8>>,
+) -> Result<String, JsError> {
+    let iv = resolve_iv(version_name, custom_iv)?;
+    let properties = crate::wz::file::parse_hotfix_data_wz(data, iv).to_js_err()?;
+    to_json_string(&children_to_json_b64(&properties))
+}
+
+// ── XML export / import ─────────────────────────────────────────────
+
+/// Export a WZ image as XML.
+///
+/// `img_name`: placed as the root `<imgdir name="...">` attribute (e.g. `"00002000.img"`).
+/// `server_mode`: if true, binary data (Canvas pixels, Sound, Lua, etc.) is omitted.
+///   If false, binary data is base64-encoded in `basedata` attributes.
+#[wasm_bindgen(js_name = "exportWzImageXml")]
+pub fn export_wz_image_xml(
+    wz_data: &[u8],
+    version_name: &str,
+    img_offset: u32,
+    img_size: u32,
+    version_hash: u32,
+    img_name: &str,
+    server_mode: bool,
+    custom_iv: Option<Vec<u8>>,
+) -> Result<String, JsError> {
+    let _ = img_size;
+    let iv = resolve_iv(version_name, custom_iv)?;
+    let (properties, _) = parse_image_props(wz_data, iv, img_offset, version_hash)?;
+    let mode = if server_mode {
+        crate::wz::xml::XmlMode::MetadataOnly
+    } else {
+        crate::wz::xml::XmlMode::WithBinaryData
+    };
+    Ok(crate::wz::xml::export_wz_xml(img_name, &properties, &mode))
+}
+
+/// Export a hotfix Data.wz (headerless image) as XML.
+#[wasm_bindgen(js_name = "exportHotfixXml")]
+pub fn export_hotfix_xml(
+    data: &[u8],
+    version_name: &str,
+    img_name: &str,
+    server_mode: bool,
+    custom_iv: Option<Vec<u8>>,
+) -> Result<String, JsError> {
+    let iv = resolve_iv(version_name, custom_iv)?;
+    let properties = crate::wz::file::parse_hotfix_data_wz(data, iv).to_js_err()?;
+    let mode = if server_mode {
+        crate::wz::xml::XmlMode::MetadataOnly
+    } else {
+        crate::wz::xml::XmlMode::WithBinaryData
+    };
+    Ok(crate::wz::xml::export_wz_xml(img_name, &properties, &mode))
+}
+
+/// Import an XML string (server or client mode) and return a packed editable binary.
+///
+/// The returned bytes have the same format as `parseWzImageForEdit` — i.e., they can
+/// be passed directly to `buildWzImage` after modification.
+#[wasm_bindgen(js_name = "importWzImageXml")]
+pub fn import_wz_image_xml(xml: &str) -> Result<Vec<u8>, JsError> {
+    let (_name, props) = crate::wz::xml::import_wz_xml(xml).to_js_err()?;
+    props_to_packed_editable(&props)
 }
 
 #[wasm_bindgen(js_name = "decodeWzCanvas")]
