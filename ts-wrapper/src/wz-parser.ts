@@ -422,6 +422,21 @@ export class WzParser {
     return this.wasm.buildMsFile(fileName, salt, JSON.stringify(entries), packedBlobs, version);
   }
 
+  // ── Utilities ─────────────────────────────────────────────────────
+
+  /**
+   * Parse a `_outlink` string of the form `"Category/_Canvas/ImageName.img/path/to/node"`.
+   * Returns `null` if the string does not match the `/_Canvas/` pattern.
+   *
+   * Browser callers can use this to identify which canvas shard file to load,
+   * then pass that file's data to `decodeWzCanvas()` with the returned `innerPath`.
+   */
+  parseOutlinkString(outlink: string): { category: string; imgName: string; innerPath: string } | null {
+    const m = outlink.match(/^([^/]+)\/_Canvas\/([^/]+\.img)\/(.+)$/);
+    if (!m) return null;
+    return { category: m[1], imgName: m[2], innerPath: m[3] };
+  }
+
   // ── Internal ──────────────────────────────────────────────────────
 
   private buildTree(dir: WzDirectoryTree): WzNode {

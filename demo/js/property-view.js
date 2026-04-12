@@ -151,7 +151,17 @@ export function renderPropertyLevel(container, props, depth, parentPath) {
             if (prop.blobIndex != null && getEditData(currentViewKey)) {
               loadCanvasFromBlob(h, propPath, prop, depth);
             } else {
-              loadCanvasPreview(h, state.currentImgOffset, propPath, prop.width, prop.height, depth);
+              const outlinkNode = prop.children?.find(c => c.name === '_outlink');
+              if (outlinkNode?.value?.includes('/_Canvas/')) {
+                const badge = document.createElement('div');
+                badge.className = 'outlink-badge';
+                badge.style.setProperty('--pdepth', depth);
+                badge.textContent = `Outlink: ${outlinkNode.value}`;
+                badge.title = 'Canvas data lives in a _Canvas shard — load that file to preview';
+                h.replaceWith(badge);
+              } else {
+                loadCanvasPreview(h, state.currentImgOffset, propPath, prop.width, prop.height, depth);
+              }
             }
           });
         if (isSound && !open)

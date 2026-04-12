@@ -1,6 +1,7 @@
 //! Python bindings for wzlib-rs via PyO3.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use pyo3::exceptions::{PyIOError, PyKeyError, PyRuntimeError, PyValueError};
@@ -476,6 +477,71 @@ fn populate_directory_fast(
     Ok(())
 }
 
+// ── _outlink canvas resolution ────────────────────────────────────────
+
+fn resolve_canvas_outlink<'py>(
+    outlink: &str,
+    wz_file_path: &std::path::Path,
+    iv: [u8; 4],
+    py: Python<'py>,
+) -> PyResult<(Bound<'py, PyBytes>, u32, u32)> {
+    // "Npc/_Canvas/0900012.img/stand/0" → ["Npc", "_Canvas", "0900012.img", "stand/0"]
+    let parts: Vec<&str> = outlink.splitn(4, '/').collect();
+    if parts.len() < 4 || parts[1] != "_Canvas" {
+        return Err(PyRuntimeError::new_err(format!(
+            "_outlink '{}' is not a /_Canvas/ reference", outlink
+        )));
+    }
+    let img_name = parts[2];
+    let inner_path = parts[3];
+
+    let canvas_dir = wz_file_path
+        .parent()
+        .ok_or_else(|| PyRuntimeError::new_err("Cannot determine parent dir of WZ file"))?
+        .join("_Canvas");
+
+    for i in 0..=9u32 {
+        let shard_path = canvas_dir.join(format!("_Canvas_{:03}.wz", i));
+        if !shard_path.exists() { break; }
+
+        let raw = std::fs::read(&shard_path)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let canvas_wz = match WzFile::parse_with_iv(&raw, WzMapleVersion::Bms, iv, None) {
+            Ok(wz) => wz,
+            Err(_) => continue,
+        };
+
+        if let Some(entry) = find_image_entry(&canvas_wz.directory, img_name) {
+            let img_iv = entry.iv.unwrap_or(iv);
+            let props = parse_image_at(&raw, img_iv, canvas_wz.version_hash,
+                                       entry.offset, &canvas_wz.header)?;
+            let prop = get_prop(&props, &path_parts(inner_path))
+                .ok_or_else(|| PyRuntimeError::new_err(format!(
+                    "Path '{}' not found in outlink canvas '{}'", inner_path, img_name
+                )))?;
+
+            match prop {
+                WzProperty::Canvas { width, height, format, png_data, .. } => {
+                    let wz_key = generate_wz_key(&img_iv, 0x10000, None);
+                    let raw_px = decompress_png_data(png_data, Some(&wz_key))
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let rgba = decode_pixels(&raw_px, *width as u32, *height as u32, *format)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    return Ok((PyBytes::new(py, &rgba), *width as u32, *height as u32));
+                }
+                other => return Err(PyValueError::new_err(format!(
+                    "Outlink target '{}' in '{}' is {}, not Canvas",
+                    inner_path, img_name, prop_type_name(other)
+                ))),
+            }
+        }
+    }
+
+    Err(PyRuntimeError::new_err(format!(
+        "Could not find '{}' in canvas shards under '{}'", img_name, canvas_dir.display()
+    )))
+}
+
 // ── WzNode ───────────────────────────────────────────────────────────
 
 #[pyclass(name = "WzNode", module = "wzlib")]
@@ -483,6 +549,7 @@ pub struct WzNode {
     root: Arc<RwLock<Vec<(String, WzProperty)>>>,
     path: Vec<String>,
     iv: [u8; 4],
+    file_path: Option<Arc<PathBuf>>,
 }
 
 #[pymethods]
@@ -540,6 +607,7 @@ impl WzNode {
                 root: Arc::clone(&self.root),
                 path: new_path,
                 iv: self.iv,
+                file_path: self.file_path.clone(),
             }))
         } else {
             Ok(None)
@@ -652,26 +720,43 @@ impl WzNode {
 
     /// Decode a Canvas node to raw RGBA8888 bytes.
     /// Returns (rgba_bytes, width, height).
+    /// If the canvas has an `_outlink` child pointing to a /_Canvas/ shard,
+    /// the shard is opened automatically and the real pixel data is decoded.
     fn decode_canvas<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyBytes>, u32, u32)> {
-        let root = self.root.read().map_err(|_| lock_err())?;
-        let parts = self.path_parts_ref();
-        let prop = get_prop(&root, &parts)
-            .ok_or_else(|| PyKeyError::new_err(self.path.join("/")))?;
-        match prop {
-            WzProperty::Canvas { width, height, format, png_data, .. } => {
-                let wz_key = generate_wz_key(&self.iv, 0x10000, None);
-                let raw = decompress_png_data(png_data, Some(&wz_key))
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let rgba = decode_pixels(&raw, *width as u32, *height as u32, *format)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok((PyBytes::new(py, &rgba), *width as u32, *height as u32))
+        let (width, height, format, png_data, outlink_str) = {
+            let root = self.root.read().map_err(|_| lock_err())?;
+            let parts = self.path_parts_ref();
+            let prop = get_prop(&root, &parts)
+                .ok_or_else(|| PyKeyError::new_err(self.path.join("/")))?;
+            match prop {
+                WzProperty::Canvas { width, height, format, png_data, properties } => {
+                    let outlink = properties.iter()
+                        .find(|(n, _)| n == "_outlink")
+                        .and_then(|(_, p)| if let WzProperty::String(s) = p { Some(s.clone()) } else { None });
+                    (*width, *height, *format, png_data.clone(), outlink)
+                }
+                other => return Err(PyValueError::new_err(format!(
+                    "Node '{}' is {}, not Canvas",
+                    self.path.join("/"),
+                    prop_type_name(other)
+                ))),
             }
-            other => Err(PyValueError::new_err(format!(
-                "Node '{}' is {}, not Canvas",
-                self.path.join("/"),
-                prop_type_name(other)
-            ))),
+        }; // read lock dropped here
+
+        if let Some(ref outlink) = outlink_str {
+            if outlink.contains("/_Canvas/") {
+                if let Some(ref file_path) = self.file_path {
+                    return resolve_canvas_outlink(outlink, file_path, self.iv, py);
+                }
+            }
         }
+
+        let wz_key = generate_wz_key(&self.iv, 0x10000, None);
+        let raw = decompress_png_data(&png_data, Some(&wz_key))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let rgba = decode_pixels(&raw, width as u32, height as u32, format)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok((PyBytes::new(py, &rgba), width as u32, height as u32))
     }
 
     /// Replace the Canvas pixel data with new RGBA8888 bytes.
@@ -880,6 +965,7 @@ fn py_value_to_typed_property(type_hint: &str, value: &Bound<'_, PyAny>) -> PyRe
 pub struct WzImage {
     props: Arc<RwLock<Vec<(String, WzProperty)>>>,
     iv: [u8; 4],
+    file_path: Option<Arc<PathBuf>>,
 }
 
 #[pymethods]
@@ -892,7 +978,7 @@ impl WzImage {
         let raw = std::fs::read(path).map_err(|e| PyIOError::new_err(e.to_string()))?;
         let props = parse_hotfix_data_wz(&raw, iv)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(Self { props: Arc::new(RwLock::new(props)), iv })
+        Ok(Self { props: Arc::new(RwLock::new(props)), iv, file_path: Some(Arc::new(PathBuf::from(path))) })
     }
 
     /// Parse a WzImage from raw bytes.
@@ -902,7 +988,7 @@ impl WzImage {
         let iv = version_to_iv(version)?;
         let props = parse_hotfix_data_wz(data, iv)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(Self { props: Arc::new(RwLock::new(props)), iv })
+        Ok(Self { props: Arc::new(RwLock::new(props)), iv, file_path: None })
     }
 
     /// Get a node by slash-separated path, e.g. "info/hp". Returns None if not found.
@@ -914,6 +1000,7 @@ impl WzImage {
                 root: Arc::clone(&self.props),
                 path: parts.into_iter().map(|s| s.to_string()).collect(),
                 iv: self.iv,
+                file_path: self.file_path.clone(),
             }))
         } else {
             Ok(None)
@@ -1023,7 +1110,7 @@ impl WzImage {
         let iv = version_to_iv(version)?;
         let (_name, props) = import_wz_xml(xml)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(Self { props: Arc::new(RwLock::new(props)), iv })
+        Ok(Self { props: Arc::new(RwLock::new(props)), iv, file_path: None })
     }
 
     /// Format all root nodes as a human-readable tree string.
@@ -1060,6 +1147,7 @@ struct WzFileInner {
     // Arc so we can clone the pointer (O(1)) to parse images without holding the lock.
     raw: Arc<Vec<u8>>,
     image_cache: HashMap<String, Arc<RwLock<Vec<(String, WzProperty)>>>>,
+    file_path: Option<Arc<PathBuf>>,
 }
 
 // ── WzFile ───────────────────────────────────────────────────────────
@@ -1086,6 +1174,7 @@ impl PyWzFile {
                 wz,
                 raw: Arc::new(raw),
                 image_cache: HashMap::new(),
+                file_path: Some(Arc::new(PathBuf::from(path))),
             })),
         })
     }
@@ -1104,7 +1193,7 @@ impl PyWzFile {
         let guard = self.inner.lock().map_err(|_| lock_err())?;
 
         if let Some(cached) = guard.image_cache.get(name) {
-            return Ok(WzImage { props: Arc::clone(cached), iv: guard.wz.iv });
+            return Ok(WzImage { props: Arc::clone(cached), iv: guard.wz.iv, file_path: guard.file_path.clone() });
         }
 
         let (offset, iv) = {
@@ -1115,6 +1204,7 @@ impl PyWzFile {
         let version_hash = guard.wz.version_hash;
         let header = guard.wz.header.clone();
         let raw = Arc::clone(&guard.raw); // O(1) — just increment refcount
+        let file_path = guard.file_path.clone();
 
         // Release lock while parsing (parsing can be slow for large images).
         drop(guard);
@@ -1128,7 +1218,7 @@ impl PyWzFile {
             .image_cache
             .entry(name.to_string())
             .or_insert_with(|| Arc::clone(&props_arc));
-        Ok(WzImage { props: Arc::clone(cached), iv })
+        Ok(WzImage { props: Arc::clone(cached), iv, file_path })
     }
 
     /// All images (including unmodified ones) are read and re-serialized.
