@@ -50,9 +50,10 @@ wzltool --json ls <file> [path]
 wzltool tree <file> [path] [--depth N]
 wzltool --json tree <file> [path] [--depth N]
 
-# Get a single value — type + value + children names
-wzltool get <file> <path>
-wzltool --json get <file> <path>
+# Get one or more values — type + value + children names
+wzltool get <file> <path> [<path2> ...]
+wzltool --json get <file> <path>           # single → object (backwards compat)
+wzltool --json get <file> <p1> <p2> <p3>  # multiple → array
 ```
 
 ### Write operations (modify and save)
@@ -72,6 +73,49 @@ wzltool rm <file> <path> [-o output]
 - `-t` / `--type`: force a WZ type — `short`, `int`, `long`, `float`, `double`, `string`, `uol`, `lua`
 - Values are auto-detected: integers → Int, decimals → Float, otherwise → String
 - For large integers (> i32), use `-t long`
+- **Canvas nodes**: pass a PNG/image file path as the value — the node's pixel data is replaced (requires Pillow). Always re-encodes as BGRA8888.
+
+```bash
+wzltool set Mob.wz "0100100.img/stand/0" new_sprite.png -o Mob_modified.wz
+```
+
+For `patch`, `"op":"set"` on a Canvas node works the same way — `"value"` is treated as a file path:
+
+```json
+{"op": "set", "path": "0100100.img/stand/0", "value": "new_sprite.png"}
+```
+
+### Batch operations — `patch` (parse once, save once)
+
+Use `patch` when making multiple changes to the same file. It opens the file once and saves once, which is significantly faster than chaining individual `set`/`add`/`rm` calls.
+
+```bash
+wzltool patch <file> --ops '<json_array>' [-o output]
+wzltool --json patch <file> --ops '<json_array>'
+```
+
+Each element of the JSON array is an operation object:
+
+| Field | Required | Values |
+|-------|----------|--------|
+| `op` | yes | `"get"`, `"set"`, `"add"`, `"rm"` |
+| `path` | yes | node path (same convention as other commands) |
+| `value` | for set/add | any scalar |
+| `type` | no | type hint: `"int"`, `"long"`, `"float"`, `"string"`, etc. |
+
+Example — read two values and apply two writes in one call:
+
+```bash
+wzltool --json patch Mob.wz --ops '[
+  {"op":"get",  "path":"0100100.img/info/maxHP"},
+  {"op":"get",  "path":"0100100.img/info/level"},
+  {"op":"set",  "path":"0100100.img/info/maxHP",  "value":99999},
+  {"op":"add",  "path":"0100100.img/info/custom", "value":1, "type":"int"},
+  {"op":"rm",   "path":"0100100.img/info/exp"}
+]' -o Mob_patched.wz
+```
+
+Output (JSON mode) is an array of result objects, one per operation, each with `"op"` and `"path"`. Errors include an `"error"` field; successful writes include `"saved_to"`. The file is saved only if at least one write operation succeeded.
 
 ### Extract operations
 
@@ -148,10 +192,14 @@ wzltool ls Character.wz "00002000.img"
 wzltool tree Character.wz "00002000.img" --depth 3
 ```
 
-### Read a specific value
+### Read specific values
 
 ```bash
+# Single value
 wzltool get Mob.wz "0100100.img/info/maxHP"
+
+# Multiple values in one call
+wzltool --json get Mob.wz "0100100.img/info/maxHP" "0100100.img/info/level"
 ```
 
 ### Modify a value and save
@@ -162,6 +210,17 @@ wzltool set Mob.wz "0100100.img/info/maxHP" 50000 -o Mob_modified.wz
 
 # Or overwrite in place
 wzltool set Mob.wz "0100100.img/info/maxHP" 50000
+```
+
+### Apply multiple changes at once (preferred for LLM tool calls)
+
+```bash
+# Parse once, apply all changes, save once — much faster than chaining set/add/rm
+wzltool --json patch Mob.wz --ops '[
+  {"op":"set", "path":"0100100.img/info/maxHP", "value":99999},
+  {"op":"set", "path":"0100100.img/info/level", "value":10},
+  {"op":"add", "path":"0100100.img/info/newProp", "value":"hello", "type":"string"}
+]' -o Mob_modified.wz
 ```
 
 ### Add a new property

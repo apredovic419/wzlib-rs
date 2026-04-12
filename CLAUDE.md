@@ -39,10 +39,11 @@ cd wzlib-py && pytest tests/
 wzltool info <file>                          # File info
 wzltool ls <file> [path]                     # List images or properties
 wzltool tree <file> [path] [--depth N]       # Property tree
-wzltool get <file> <path>                    # Get value
+wzltool get <file> <path> [<path2> ...]      # Get one or more values
 wzltool set <file> <path> <value> [-o out]   # Set value
 wzltool add <file> <path> <value> [-o out]   # Add node
 wzltool rm <file> <path> [-o out]            # Remove node
+wzltool patch <file> --ops '<json>' [-o out] # Batch get/set/add/rm (one save)
 wzltool extract <file> <path> -o <out>       # Extract canvas/sound
 # Add --json before subcommand for machine-readable output
 # Add -V gms/ems/bms for encryption version (default: bms)

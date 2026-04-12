@@ -585,6 +585,16 @@ impl WzNode {
             .and_then(|p| p.as_str().map(|s| s.to_string())))
     }
 
+    /// Return (x, y) for a Vector node, or None if not a Vector.
+    fn as_vec(&self) -> PyResult<Option<(i32, i32)>> {
+        let root = self.root.read().map_err(|_| lock_err())?;
+        let parts = self.path_parts_ref();
+        Ok(get_prop(&root, &parts).and_then(|p| match p {
+            WzProperty::Vector { x, y } => Some((*x, *y)),
+            _ => None,
+        }))
+    }
+
     /// Names of direct child nodes. Returns [] for leaf nodes.
     fn children(&self) -> PyResult<Vec<String>> {
         let root = self.root.read().map_err(|_| lock_err())?;

@@ -89,6 +89,28 @@ def _parse_value(value_str: str, type_hint: str = None):
     return value_str
 
 
+def _load_image_rgba(path: str):
+    """Load an image file and return (rgba_bytes, width, height).
+
+    Requires Pillow. Raises ImportError with a hint if it's not installed.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ImportError("Pillow is required for Canvas operations: pip install Pillow")
+    img = Image.open(path).convert("RGBA")
+    width, height = img.size
+    return bytes(img.tobytes()), width, height
+
+
+def _set_canvas(node, value_str: str) -> None:
+    """Replace canvas pixel data. value_str must be a path to an image file."""
+    if not os.path.isfile(value_str):
+        raise FileNotFoundError(f"Image file not found: {value_str}")
+    rgba, width, height = _load_image_rgba(value_str)
+    node.replace_canvas(rgba, width, height)
+
+
 # ── Commands ─────────────────────────────────────────────────────────────
 
 def cmd_info(args):
@@ -228,15 +250,8 @@ def _print_tree(obj, args):
         print(obj.to_tree_str(args.depth))
 
 
-def cmd_get(args):
-    """Get a node value."""
-    wz, img = _open(args.file, args.version)
-    img_obj, node = _resolve_path(wz, img, args.path)
-
-    if node is None:
-        print(f"Error: path not found: {args.path}", file=sys.stderr)
-        return 1
-
+def _get_node_result(node, path: str) -> dict:
+    """Extract a node's value/type/children into a result dict."""
     ntype = node.node_type()
     value = None
     if ntype in ("Short", "Int", "Long"):
@@ -245,30 +260,58 @@ def cmd_get(args):
         value = node.as_float()
     elif ntype in ("String", "UOL"):
         value = node.as_str()
-    elif ntype == "Null":
-        value = None
 
-    result = {"path": args.path, "type": ntype, "value": value}
-
+    result = {"path": path, "type": ntype, "value": value}
     children = node.children()
     if children:
         result["children"] = children
+    return result
+
+
+def cmd_get(args):
+    """Get one or more node values."""
+    wz, img = _open(args.file, args.version)
+
+    # Support multiple paths
+    paths = args.path  # now a list
+    results = []
+    exit_code = 0
+
+    for path in paths:
+        img_obj, node = _resolve_path(wz, img, path)
+        if node is None:
+            if args.json:
+                results.append({"path": path, "error": "not found"})
+            else:
+                print(f"Error: path not found: {path}", file=sys.stderr)
+            exit_code = 1
+            continue
+        results.append(_get_node_result(node, path))
 
     if args.json:
-        print(json.dumps(result, indent=2))
+        # Single path → object for backwards compat; multiple → array
+        output = results[0] if len(results) == 1 else results
+        print(json.dumps(output, indent=2))
     else:
-        print(f"Path: {args.path}")
-        print(f"Type: {ntype}")
-        if value is not None:
-            print(f"Value: {value}")
-        elif ntype == "Null":
-            print("Value: null")
-        if children:
-            print(f"Children: {', '.join(children)}")
+        for r in results:
+            if "error" in r:
+                continue
+            if len(paths) > 1:
+                print(f"--- {r['path']} ---")
+            print(f"Path: {r['path']}")
+            print(f"Type: {r['type']}")
+            if r["value"] is not None:
+                print(f"Value: {r['value']}")
+            elif r["type"] == "Null":
+                print("Value: null")
+            if r.get("children"):
+                print(f"Children: {', '.join(r['children'])}")
+
+    return exit_code or None
 
 
 def cmd_set(args):
-    """Set a node value."""
+    """Set a node value (or replace Canvas pixel data with an image file)."""
     wz, img = _open(args.file, args.version)
     img_obj, node = _resolve_path(wz, img, args.path)
 
@@ -276,8 +319,14 @@ def cmd_set(args):
         print(f"Error: path not found: {args.path}", file=sys.stderr)
         return 1
 
-    value = _parse_value(args.value, args.type)
-    node.set(value)
+    ntype = node.node_type()
+    if ntype == "Canvas":
+        _set_canvas(node, args.value)
+        display_value = f"<image:{args.value}>"
+    else:
+        value = _parse_value(args.value, args.type)
+        node.set(value)
+        display_value = repr(value)
 
     output = args.output or args.file
     if wz is not None:
@@ -286,9 +335,14 @@ def cmd_set(args):
         img_obj.save(output)
 
     if args.json:
-        print(json.dumps({"status": "ok", "path": args.path, "value": value, "output": output}))
+        result = {"status": "ok", "path": args.path, "output": output}
+        if ntype == "Canvas":
+            result["canvas_source"] = args.value
+        else:
+            result["value"] = value
+        print(json.dumps(result))
     else:
-        print(f"Set {args.path} = {value!r}")
+        print(f"Set {args.path} = {display_value}")
         print(f"Saved to: {output}")
 
 
@@ -415,6 +469,173 @@ def cmd_rm(args):
     else:
         print(f"Removed {args.path}")
         print(f"Saved to: {output}")
+
+
+def _apply_op(wz, img, op: dict) -> dict:
+    """Apply a single patch operation. Returns a result dict."""
+    kind = op.get("op")
+    path = op.get("path", "")
+
+    if kind == "get":
+        img_obj, node = _resolve_path(wz, img, path)
+        if node is None:
+            return {"op": "get", "path": path, "error": "not found"}
+        return {"op": "get", **_get_node_result(node, path)}
+
+    elif kind == "set":
+        img_obj, node = _resolve_path(wz, img, path)
+        if node is None:
+            return {"op": "set", "path": path, "error": "not found"}
+        ntype = node.node_type()
+        if ntype == "Canvas":
+            canvas_src = str(op["value"])
+            try:
+                _set_canvas(node, canvas_src)
+            except (FileNotFoundError, ImportError) as e:
+                return {"op": "set", "path": path, "error": str(e)}
+            return {"op": "set", "path": path, "canvas_source": canvas_src}
+        value = _parse_value(str(op["value"]), op.get("type"))
+        node.set(value)
+        return {"op": "set", "path": path, "value": value}
+
+    elif kind == "add":
+        if "/" in path:
+            parent_path, name = path.rsplit("/", 1)
+        else:
+            parent_path, name = "", path
+
+        value = _parse_value(str(op["value"]), op.get("type"))
+
+        if wz is not None:
+            parts = (parent_path or name).split("/", 1)
+            image_name = parts[0]
+            img_obj = wz.image(image_name)
+            inner_parent = parts[1] if len(parts) > 1 else ""
+            if parent_path and inner_parent:
+                parent_node = img_obj.get(inner_parent)
+                if parent_node is None:
+                    return {"op": "add", "path": path, "error": f"parent not found: {parent_path}"}
+                if op.get("type"):
+                    parent_node.add_typed(name, op["type"], value)
+                else:
+                    parent_node.add(name, value)
+            elif parent_path:
+                if op.get("type"):
+                    img_obj.add_typed(name, op["type"], value)
+                else:
+                    img_obj.add(name, value)
+            else:
+                return {"op": "add", "path": path, "error": "cannot add at image level in .wz file"}
+        else:
+            if parent_path:
+                parent_node = img.get(parent_path)
+                if parent_node is None:
+                    return {"op": "add", "path": path, "error": f"parent not found: {parent_path}"}
+                if op.get("type"):
+                    parent_node.add_typed(name, op["type"], value)
+                else:
+                    parent_node.add(name, value)
+            else:
+                if op.get("type"):
+                    img.add_typed(name, op["type"], value)
+                else:
+                    img.add(name, value)
+
+        return {"op": "add", "path": path, "value": value}
+
+    elif kind == "rm":
+        if "/" in path:
+            parent_path, name = path.rsplit("/", 1)
+        else:
+            parent_path, name = "", path
+
+        removed = False
+        if wz is not None:
+            parts = (parent_path or name).split("/", 1)
+            image_name = parts[0]
+            img_obj = wz.image(image_name)
+            inner_parent = parts[1] if len(parts) > 1 else ""
+            if parent_path and inner_parent:
+                parent_node = img_obj.get(inner_parent)
+                if parent_node is None:
+                    return {"op": "rm", "path": path, "error": f"parent not found: {parent_path}"}
+                removed = parent_node.remove(name)
+            else:
+                removed = img_obj.remove(name)
+        else:
+            if parent_path:
+                parent_node = img.get(parent_path)
+                if parent_node is None:
+                    return {"op": "rm", "path": path, "error": f"parent not found: {parent_path}"}
+                removed = parent_node.remove(name)
+            else:
+                removed = img.remove(name)
+
+        if not removed:
+            return {"op": "rm", "path": path, "error": "not found"}
+        return {"op": "rm", "path": path, "removed": True}
+
+    else:
+        return {"op": kind, "path": path, "error": f"unknown op: {kind!r}"}
+
+
+def cmd_patch(args):
+    """Apply multiple get/set/add/rm operations in a single file open/save cycle."""
+    try:
+        ops = json.loads(args.ops)
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON in --ops: {e}", file=sys.stderr)
+        return 1
+
+    if not isinstance(ops, list):
+        print("Error: --ops must be a JSON array", file=sys.stderr)
+        return 1
+
+    wz, img = _open(args.file, args.version)
+    results = []
+    has_writes = False
+    has_errors = False
+
+    for op in ops:
+        result = _apply_op(wz, img, op)
+        results.append(result)
+        if "error" in result:
+            has_errors = True
+        if op.get("op") in ("set", "add", "rm") and "error" not in result:
+            has_writes = True
+
+    if has_writes:
+        output = args.output or args.file
+        if wz is not None:
+            wz.save(output)
+        else:
+            img.save(output)
+        for r in results:
+            if r.get("op") in ("set", "add", "rm") and "error" not in r:
+                r["saved_to"] = output
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for r in results:
+            op = r.get("op")
+            path = r.get("path", "")
+            if "error" in r:
+                print(f"Error [{op}] {path}: {r['error']}", file=sys.stderr)
+            elif op == "get":
+                ntype = r.get("type", "?")
+                value = r.get("value")
+                print(f"get  {path} ({ntype}) = {value!r}")
+                if r.get("children"):
+                    print(f"     children: {', '.join(r['children'])}")
+            elif op == "set":
+                print(f"set  {path} = {r['value']!r}  → {r.get('saved_to', '(pending)')}")
+            elif op == "add":
+                print(f"add  {path} = {r['value']!r}  → {r.get('saved_to', '(pending)')}")
+            elif op == "rm":
+                print(f"rm   {path}  → {r.get('saved_to', '(pending)')}")
+
+    return 1 if has_errors else None
 
 
 def cmd_xml(args):
@@ -569,9 +790,9 @@ def main():
                    help="Maximum depth to display (-1 = unlimited)")
 
     # get
-    p = sub.add_parser("get", help="Get a node value")
+    p = sub.add_parser("get", help="Get one or more node values")
     p.add_argument("file", help="WZ or IMG file path")
-    p.add_argument("path", help="Node path (e.g. 'Image.img/info/hp')")
+    p.add_argument("path", nargs="+", help="Node path(s) (e.g. 'Image.img/info/hp')")
 
     # set
     p = sub.add_parser("set", help="Set a node value")
@@ -614,6 +835,26 @@ def main():
     p.add_argument("xml_file", help="XML file to import")
     p.add_argument("--output", "-o", help="Output IMG file (default: <xml_file>.img)")
 
+    # patch — batch get/set/add/rm in one file open/save cycle
+    p = sub.add_parser(
+        "patch",
+        help="Apply multiple operations in one file open/save cycle",
+        description=(
+            "Apply a JSON array of operations to a WZ/IMG file, parsing once and saving once.\n"
+            "Each operation is an object with 'op' (get/set/add/rm), 'path', and optionally\n"
+            "'value' and 'type'. Example:\n"
+            '  --ops \'[{"op":"set","path":"info/hp","value":9999},'
+            '{"op":"rm","path":"info/mp"}]\''
+        ),
+    )
+    p.add_argument("file", help="WZ or IMG file path")
+    p.add_argument(
+        "--ops",
+        required=True,
+        help='JSON array of operations: [{"op":"get|set|add|rm","path":"...","value":..., "type":"..."}]',
+    )
+    p.add_argument("--output", "-o", help="Output file (default: overwrite input)")
+
     args = parser.parse_args()
 
     try:
@@ -628,6 +869,7 @@ def main():
             "extract": cmd_extract,
             "xml": cmd_xml,
             "xml-import": cmd_xml_import,
+            "patch": cmd_patch,
         }[args.command]
         result = func(args)
         sys.exit(result or 0)
