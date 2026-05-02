@@ -37,17 +37,63 @@ def _open(path: str, version: str, patch_version=None):
         return None, img
 
 
+def _list_dir_children(wz, prefix: str):
+    """List immediate children (subdirs, images) under a WZ directory prefix.
+
+    Empty prefix means the root. Returns (subdirs, images) as sorted lists.
+    """
+    norm = prefix.strip("/")
+    subdirs = set()
+    images_here = []
+    for img_path in wz.list_images():
+        if norm:
+            if not img_path.startswith(norm + "/"):
+                continue
+            rest = img_path[len(norm) + 1:]
+        else:
+            rest = img_path
+        parts = rest.split("/", 1)
+        if len(parts) == 1:
+            images_here.append(parts[0])
+        else:
+            subdirs.add(parts[0])
+    return sorted(subdirs), sorted(images_here)
+
+
+def _is_image_path(path: str) -> bool:
+    """A path that points at an image (or a property inside one) contains
+    a segment ending in `.img`. Bare directory paths do not."""
+    return any(p.endswith(".img") for p in path.split("/"))
+
+
+def _split_wz_path(node_path: str):
+    """Split a WZ-relative path into (image_path, prop_path).
+
+    Image paths can include subdirectories (e.g. "UI/UIWindow.img"). The
+    image segment is identified by the rightmost component ending in ".img".
+    Falls back to "first slash" if no such segment exists.
+    """
+    parts = node_path.split("/")
+    last_img = -1
+    for i, p in enumerate(parts):
+        if p.endswith(".img"):
+            last_img = i
+    if last_img >= 0:
+        return "/".join(parts[:last_img + 1]), "/".join(parts[last_img + 1:])
+    if "/" in node_path:
+        head, _, tail = node_path.partition("/")
+        return head, tail
+    return node_path, ""
+
+
 def _resolve_path(wz, img, node_path: str):
     """Given a node path, return the WzNode.
 
-    For .wz files the path is "ImageName.img/prop/path".
+    For .wz files the path is "[Sub/Dirs/]ImageName.img/prop/path".
     For .img files the path is "prop/path".
     """
     if wz is not None:
-        # Split into image name and property path
-        parts = node_path.split("/", 1) if "/" in node_path else [node_path, ""]
-        image_name = parts[0]
-        prop_path = parts[1] if len(parts) > 1 else ""
+        image_name, prop_path = _split_wz_path(node_path)
         img_obj = wz.image(image_name)
         if not prop_path:
             return img_obj, None  # return the image itself
@@ -151,11 +197,23 @@ def cmd_ls(args):
     wz, img = _open(args.file, args.version)
 
     if wz is not None:
+        if args.path and not _is_image_path(args.path):
+            # Directory listing: subdirs + images at this prefix
+            subdirs, images_here = _list_dir_children(wz, args.path)
+            if not subdirs and not images_here:
+                print(f"Error: directory not found or empty: {args.path}", file=sys.stderr)
+                return 1
+            items = ([{"name": s, "type": "Directory"} for s in subdirs]
+                     + [{"name": n, "type": "Image"} for n in images_here])
+            if args.json:
+                print(json.dumps(items, indent=2))
+            else:
+                for item in items:
+                    print(f"  {item['type']:15s} {item['name']}")
+            return
         if args.path:
             # List properties inside an image
-            parts = args.path.split("/", 1)
-            image_name = parts[0]
-            prop_path = parts[1] if len(parts) > 1 else ""
+            image_name, prop_path = _split_wz_path(args.path)
             img_obj = wz.image(image_name)
 
             if prop_path:
@@ -218,9 +276,7 @@ def cmd_tree(args):
                     print(f"  {name}")
             return
 
-        parts = args.path.split("/", 1)
-        image_name = parts[0]
-        prop_path = parts[1] if len(parts) > 1 else ""
+        image_name, prop_path = _split_wz_path(args.path)
         img_obj = wz.image(image_name)
 
         if prop_path:
@@ -360,31 +416,28 @@ def cmd_add(args):
     value = _parse_value(args.value, args.type)
 
     if wz is not None:
-        # For WZ: parent_path must include image name
-        parts = (parent_path or name).split("/", 1)
-        image_name = parts[0]
-        img_obj = wz.image(image_name)
-
-        if parent_path:
-            inner_parent = parts[1] if len(parts) > 1 else ""
-            if inner_parent:
-                parent_node = img_obj.get(inner_parent)
-                if parent_node is None:
-                    print(f"Error: parent path not found: {parent_path}", file=sys.stderr)
-                    return 1
-                if args.type:
-                    parent_node.add_typed(name, args.type, value)
-                else:
-                    parent_node.add(name, value)
-            else:
-                if args.type:
-                    img_obj.add_typed(name, args.type, value)
-                else:
-                    img_obj.add(name, value)
-        else:
+        # For WZ: parent_path must include the image name
+        image_name, inner_parent = _split_wz_path(parent_path or name)
+        if not parent_path:
             # name is the image name itself — can't add at this level
             print("Error: cannot add at the image level in a .wz file", file=sys.stderr)
             return 1
+        img_obj = wz.image(image_name)
+
+        if inner_parent:
+            parent_node = img_obj.get(inner_parent)
+            if parent_node is None:
+                print(f"Error: parent path not found: {parent_path}", file=sys.stderr)
+                return 1
+            if args.type:
+                parent_node.add_typed(name, args.type, value)
+            else:
+                parent_node.add(name, value)
+        else:
+            if args.type:
+                img_obj.add_typed(name, args.type, value)
+            else:
+                img_obj.add(name, value)
     else:
         if parent_path:
             parent_node = img.get(parent_path)
@@ -428,20 +481,15 @@ def cmd_rm(args):
     removed = False
 
     if wz is not None:
-        parts = (parent_path or name).split("/", 1)
-        image_name = parts[0]
+        image_name, inner_parent = _split_wz_path(parent_path or name)
         img_obj = wz.image(image_name)
 
-        if parent_path:
-            inner_parent = parts[1] if len(parts) > 1 else ""
-            if inner_parent:
-                parent_node = img_obj.get(inner_parent)
-                if parent_node is None:
-                    print(f"Error: parent path not found: {parent_path}", file=sys.stderr)
-                    return 1
-                removed = parent_node.remove(name)
-            else:
-                removed = img_obj.remove(name)
+        if parent_path and inner_parent:
+            parent_node = img_obj.get(inner_parent)
+            if parent_node is None:
+                print(f"Error: parent path not found: {parent_path}", file=sys.stderr)
+                return 1
+            removed = parent_node.remove(name)
         else:
             removed = img_obj.remove(name)
     else:
@@ -507,11 +555,11 @@ def _apply_op(wz, img, op: dict) -> dict:
         value = _parse_value(str(op["value"]), op.get("type"))
 
         if wz is not None:
-            parts = (parent_path or name).split("/", 1)
-            image_name = parts[0]
+            if not parent_path:
+                return {"op": "add", "path": path, "error": "cannot add at image level in .wz file"}
+            image_name, inner_parent = _split_wz_path(parent_path)
             img_obj = wz.image(image_name)
-            inner_parent = parts[1] if len(parts) > 1 else ""
-            if parent_path and inner_parent:
+            if inner_parent:
                 parent_node = img_obj.get(inner_parent)
                 if parent_node is None:
                     return {"op": "add", "path": path, "error": f"parent not found: {parent_path}"}
@@ -519,13 +567,11 @@ def _apply_op(wz, img, op: dict) -> dict:
                     parent_node.add_typed(name, op["type"], value)
                 else:
                     parent_node.add(name, value)
-            elif parent_path:
+            else:
                 if op.get("type"):
                     img_obj.add_typed(name, op["type"], value)
                 else:
                     img_obj.add(name, value)
-            else:
-                return {"op": "add", "path": path, "error": "cannot add at image level in .wz file"}
         else:
             if parent_path:
                 parent_node = img.get(parent_path)
@@ -551,10 +597,8 @@ def _apply_op(wz, img, op: dict) -> dict:
 
         removed = False
         if wz is not None:
-            parts = (parent_path or name).split("/", 1)
-            image_name = parts[0]
+            image_name, inner_parent = _split_wz_path(parent_path or name)
             img_obj = wz.image(image_name)
-            inner_parent = parts[1] if len(parts) > 1 else ""
             if parent_path and inner_parent:
                 parent_node = img_obj.get(inner_parent)
                 if parent_node is None:
@@ -647,9 +691,7 @@ def cmd_xml(args):
         if not args.path:
             print("Error: --path required when exporting from a .wz file", file=sys.stderr)
             return 1
-        parts = args.path.split("/", 1)
-        image_name = parts[0]
-        prop_path = parts[1] if len(parts) > 1 else ""
+        image_name, prop_path = _split_wz_path(args.path)
         img_obj = wz.image(image_name)
         if prop_path:
             node = img_obj.get(prop_path)
@@ -658,7 +700,9 @@ def cmd_xml(args):
                 return 1
             xml_str = node.to_xml(mode)
         else:
-            xml_str = img_obj.to_xml(mode, image_name)
+            # XML root element is the image's leaf name only (e.g. "UIWindow.img"),
+            # not the full WZ path "UI/UIWindow.img".
+            xml_str = img_obj.to_xml(mode, image_name.split("/")[-1])
     else:
         if args.path:
             node = img.get(args.path)
@@ -695,6 +739,206 @@ def cmd_xml_import(args):
         print(json.dumps({"status": "ok", "output": output}))
     else:
         print(f"Saved to: {output}")
+
+
+def _collect_build_inputs(src_dir: Path):
+    """Walk src_dir and return [(wz_path, source_file, kind)] in DFS order.
+
+    Same-name conflicts (`X.img` and `X.img.xml` both present) → prefer .xml
+    and warn on stderr. The .img sibling is silently dropped.
+    """
+    # Group by directory, then by stripped image name.
+    # wz_path uses '/' separators regardless of platform.
+    inputs = []
+    warned = []
+
+    def walk(dir_path: Path, wz_prefix: str):
+        # Single iterdir pass: collect images here + subdir paths to recurse into.
+        candidates = {}  # stripped_name -> (path, "xml"|"img")
+        subdirs = []
+        for child in sorted(dir_path.iterdir()):
+            if child.is_dir():
+                subdirs.append(child)
+                continue
+            name = child.name
+            if name.endswith(".img.xml"):
+                key, kind = name[:-4], "xml"  # "UIWindow.img.xml" → "UIWindow.img"
+            elif name.endswith(".img"):
+                key, kind = name, "img"
+            else:
+                continue  # ignore unrelated files (.bak, README.md, etc.)
+            existing = candidates.get(key)
+            if existing is None:
+                candidates[key] = (child, kind)
+            elif existing[1] == "xml":
+                warned.append((wz_prefix, key, "kept .xml, ignored .img"))
+            else:
+                candidates[key] = (child, kind)
+                warned.append((wz_prefix, key, "replaced .img with .xml"))
+
+        for key in sorted(candidates):
+            path, kind = candidates[key]
+            wz_path = f"{wz_prefix}/{key}" if wz_prefix else key
+            inputs.append((wz_path, path, kind))
+
+        for child in subdirs:
+            sub_prefix = f"{wz_prefix}/{child.name}" if wz_prefix else child.name
+            walk(child, sub_prefix)
+
+    walk(src_dir, "")
+
+    for prefix, key, msg in warned:
+        loc = f"{prefix}/{key}" if prefix else key
+        print(f"warning: conflict at {loc}: {msg}", file=sys.stderr)
+
+    return inputs
+
+
+def cmd_build(args):
+    """Build a WZ file from a directory tree of .img / .img.xml files."""
+    src_dir = Path(args.src_dir)
+    if not src_dir.is_dir():
+        print(f"Error: source is not a directory: {src_dir}", file=sys.stderr)
+        return 1
+
+    # Warn when both -e and --patch-version are at their defaults: a roundtrip
+    # from a non-GMS / non-v83 source would silently change encryption + version.
+    if args.encryption is None and args.patch_version is None:
+        print("warning: using defaults --encryption gms --patch-version 83. "
+              "If the source was not GMS v83, pass -e and --patch-version explicitly "
+              "to preserve the original variant.", file=sys.stderr)
+    encryption = args.encryption or "gms"
+    patch_version = args.patch_version if args.patch_version is not None else 83
+
+    inputs = _collect_build_inputs(src_dir)
+    if not inputs:
+        print(f"Error: no .img or .img.xml files found in {src_dir}", file=sys.stderr)
+        return 1
+
+    total = len(inputs)
+    use_progress = not args.json and sys.stderr.isatty()
+    progress_width = 0
+
+    entries = []
+    for i, (wz_path, src_path, kind) in enumerate(inputs, 1):
+        if use_progress:
+            line = f"[{i}/{total}] {kind:3s} {wz_path}"
+            pad = max(0, progress_width - len(line))
+            sys.stderr.write("\r" + line + " " * pad)
+            sys.stderr.flush()
+            progress_width = max(progress_width, len(line))
+        elif not args.json:
+            print(f"[{i}/{total}] {kind} {wz_path}", file=sys.stderr)
+
+        if kind == "xml":
+            with open(src_path, encoding="utf-8") as f:
+                xml_str = f.read()
+            img = WzImage.from_xml(xml_str, version=encryption)
+            entries.append((wz_path, img.build()))
+        else:  # img
+            with open(src_path, "rb") as f:
+                entries.append((wz_path, f.read()))
+
+    if use_progress:
+        sys.stderr.write("\r" + " " * progress_width + "\r")
+        sys.stderr.flush()
+
+    if not args.json:
+        print(f"Assembling {total} images into {args.output}...", file=sys.stderr)
+
+    size = WzFile.build_to_file(
+        entries, args.output,
+        version=encryption,
+        patch_version=patch_version,
+        is_64bit=args.is_64bit,
+    )
+
+    if args.json:
+        print(json.dumps({
+            "status": "ok",
+            "output": args.output,
+            "size": size,
+            "images": total,
+            "encryption": encryption,
+            "patch_version": patch_version,
+            "is_64bit": args.is_64bit,
+        }))
+    else:
+        print(f"Built {args.output}: {size} bytes, {total} images "
+              f"(v{patch_version} {encryption}{' 64-bit' if args.is_64bit else ''})",
+              file=sys.stderr)
+
+
+def cmd_export(args):
+    """Export an entire WZ file to a directory tree of XML or IMG files.
+
+    Output mirrors the WZ folder structure:
+      out_dir/UI/UIWindow.img.xml
+      out_dir/Mob/0100100.img.xml
+    For --format img, files are written as raw .img binaries (no .xml suffix).
+    """
+    wz, _ = _open(args.file, args.version)
+    if wz is None:
+        print("Error: export requires a .wz file (got a standalone .img)", file=sys.stderr)
+        return 1
+
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    images = wz.list_images()
+    total = len(images)
+    fmt = args.format
+    mode = args.mode
+
+    use_progress = not args.json and sys.stderr.isatty()
+    progress_width = 0  # track longest line for \r overwrite
+
+    for i, img_path in enumerate(images, 1):
+        # Mirror "UI/UIWindow.img" → out_dir/UI/UIWindow.img(.xml)
+        parts = img_path.split("/")
+        rel_parts = parts[:-1]
+        leaf = parts[-1]
+        target_dir = out_dir.joinpath(*rel_parts) if rel_parts else out_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        if fmt == "xml":
+            out_path = target_dir / f"{leaf}.xml"
+        else:
+            out_path = target_dir / leaf
+
+        # Progress (stderr; \r-overwrite if interactive)
+        if use_progress:
+            line = f"[{i}/{total}] {img_path}"
+            pad = max(0, progress_width - len(line))
+            sys.stderr.write("\r" + line + " " * pad)
+            sys.stderr.flush()
+            progress_width = max(progress_width, len(line))
+        elif not args.json:
+            print(f"[{i}/{total}] {img_path}", file=sys.stderr)
+
+        if fmt == "xml":
+            img = wz.image(img_path)
+            xml_str = img.to_xml(mode, leaf)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(xml_str)
+            # Drop parsed property tree to keep memory bounded on large WZs.
+            wz.evict_image(img_path)
+        else:  # img — byte-identical raw slice, no parse / re-serialize
+            wz.dump_image_raw(img_path, str(out_path))
+
+    if use_progress:
+        sys.stderr.write("\r" + " " * progress_width + "\r")
+        sys.stderr.flush()
+
+    if args.json:
+        print(json.dumps({
+            "status": "ok",
+            "format": fmt,
+            "exported": total,
+            "output": str(out_dir),
+        }))
+    else:
+        print(f"Exported {total} images ({fmt}) to {out_dir}", file=sys.stderr)
 
 
 def cmd_extract(args):
@@ -768,8 +1012,8 @@ def main():
         description="CLI for inspecting and editing MapleStory WZ/IMG files",
     )
     parser.add_argument("--json", action="store_true", help="JSON output mode")
-    parser.add_argument("--version", "-V", default="bms",
-                        help="Encryption version: gms, ems, bms (default: bms)")
+    parser.add_argument("--version", "-V", default="auto",
+                        help="Encryption version: auto, gms, ems, bms (default: auto)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -835,6 +1079,42 @@ def main():
     p.add_argument("xml_file", help="XML file to import")
     p.add_argument("--output", "-o", help="Output IMG file (default: <xml_file>.img)")
 
+    # build — rebuild a WZ file from a directory tree of .img / .img.xml
+    p = sub.add_parser(
+        "build",
+        help="Build a WZ file from a directory tree of .img / .img.xml files",
+        description=(
+            "Walk <src_dir> and pack every .img / .img.xml into a complete "
+            "WZ archive. Mixed formats are allowed; on same-name conflict "
+            "(both .img and .img.xml), .xml wins."
+        ),
+    )
+    p.add_argument("src_dir", help="Source directory tree (mirrors WZ structure)")
+    p.add_argument("--output", "-o", required=True, help="Output WZ file path")
+    p.add_argument("--encryption", "-e", default=None, choices=["gms", "ems", "bms"],
+                   help="Encryption variant for the output file (default: gms)")
+    p.add_argument("--patch-version", type=int, default=None,
+                   help="Patch version number (default: 83)")
+    p.add_argument("--64bit", dest="is_64bit", action="store_true",
+                   help="Produce a 64-bit (v770+) WZ file")
+
+    # export — bulk export entire WZ to a directory tree
+    p = sub.add_parser(
+        "export",
+        help="Export entire WZ file to a directory tree (XML or IMG)",
+        description=(
+            "Walk the WZ directory tree and write each image to a mirrored "
+            "path under <output>/. XML mode writes <name>.img.xml files; "
+            "IMG mode writes raw .img binaries."
+        ),
+    )
+    p.add_argument("file", help="WZ file path")
+    p.add_argument("--output", "-o", required=True, help="Output directory")
+    p.add_argument("--format", "-f", choices=["xml", "img"], default="xml",
+                   help="Export format: xml (HaRepacker-compatible) or img (raw binary). Default: xml")
+    p.add_argument("--mode", "-m", default="client", choices=["server", "client"],
+                   help="XML mode: server (metadata only) or client (with base64 binary). Default: client")
+
     # patch — batch get/set/add/rm in one file open/save cycle
     p = sub.add_parser(
         "patch",
@@ -869,6 +1149,8 @@ def main():
             "extract": cmd_extract,
             "xml": cmd_xml,
             "xml-import": cmd_xml_import,
+            "export": cmd_export,
+            "build": cmd_build,
             "patch": cmd_patch,
         }[args.command]
         result = func(args)

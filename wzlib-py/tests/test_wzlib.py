@@ -665,3 +665,314 @@ class TestJsonBase64:
         parsed = json.loads(j)
         assert parsed["type"] == "Int"
         assert parsed["value"] == 42
+
+
+# ── CLI path splitting ────────────────────────────────────────────────────────
+
+
+class TestSplitWzPath:
+    """Tests for the _split_wz_path helper in cli.py.
+
+    The function splits a WZ-relative path into (image_path, prop_path) by
+    locating the rightmost component ending in `.img`.
+    """
+
+    @pytest.mark.parametrize("path,expected", [
+        # Single image at root
+        ("a.img",            ("a.img", "")),
+        # Image at root + property path
+        ("a.img/b",          ("a.img", "b")),
+        ("a.img/b/c/d",      ("a.img", "b/c/d")),
+        # Image inside subdirectory
+        ("x/a.img",          ("x/a.img", "")),
+        ("x/a.img/b",        ("x/a.img", "b")),
+        ("x/y/a.img/b/c",    ("x/y/a.img", "b/c")),
+        # Multiple .img segments → rightmost wins
+        ("x.img/y.img",      ("x.img/y.img", "")),
+        ("x.img/y.img/p",    ("x.img/y.img", "p")),
+        # No .img segment: fall back to first-slash split (legacy behaviour)
+        ("a/b",              ("a", "b")),
+        ("a/b/c",            ("a", "b/c")),
+        # Bare name, no slash, no .img
+        ("foo",              ("foo", "")),
+        # Empty input
+        ("",                 ("", "")),
+    ])
+    def test_split(self, path, expected):
+        from wzlib.cli import _split_wz_path
+        assert _split_wz_path(path) == expected
+
+    def test_is_image_path(self):
+        from wzlib.cli import _is_image_path
+        assert _is_image_path("a.img") is True
+        assert _is_image_path("a.img/b") is True
+        assert _is_image_path("x/a.img") is True
+        assert _is_image_path("x/a.img/b/c") is True
+        assert _is_image_path("UI") is False
+        assert _is_image_path("UI/Sub") is False
+        assert _is_image_path("") is False
+
+
+# ── Build / Export / Roundtrip ────────────────────────────────────────────────
+
+
+def _make_xml_image(name: str, properties: str) -> str:
+    """Helper: build an image XML string with the given inline property markup."""
+    return (f'<?xml version="1.0" encoding="utf-8"?>\n'
+            f'<imgdir name="{name}">{properties}</imgdir>')
+
+
+class TestWzFileBuild:
+    """Tests for WzFile.build_to_file (in-memory tree assembly + serialize)."""
+
+    def test_build_then_open_roundtrip(self, tmp_path):
+        """Build a WZ from synthetic images, parse it back, verify structure + values."""
+        img1 = WzImage.from_xml(
+            _make_xml_image("UIWindow.img",
+                            '<int name="hp" value="100"/><string name="title" value="hello"/>'),
+            version="gms")
+        img2 = WzImage.from_xml(
+            _make_xml_image("UIWindowEx.img", '<int name="mp" value="50"/>'), version="gms")
+        img3 = WzImage.from_xml(
+            _make_xml_image("0100100.img", '<string name="name" value="Snail"/>'), version="gms")
+
+        entries = [
+            ("UI/UIWindow.img", img1.build()),
+            ("UI/UIWindowEx.img", img2.build()),
+            ("Mob/0100100.img", img3.build()),
+        ]
+        out = tmp_path / "built.wz"
+        size = WzFile.build_to_file(entries, str(out), version="gms", patch_version=83)
+        assert size > 0
+        assert out.exists() and out.stat().st_size == size
+
+        wz = WzFile.open(str(out), version="gms", patch_version=83)
+        assert sorted(wz.list_images()) == [
+            "Mob/0100100.img", "UI/UIWindow.img", "UI/UIWindowEx.img",
+        ]
+        assert wz.image("UI/UIWindow.img").get("hp").as_int() == 100
+        assert wz.image("UI/UIWindow.img").get("title").as_str() == "hello"
+        assert wz.image("UI/UIWindowEx.img").get("mp").as_int() == 50
+        assert wz.image("Mob/0100100.img").get("name").as_str() == "Snail"
+
+    def test_build_empty_entries_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="zero images"):
+            WzFile.build_to_file([], str(tmp_path / "empty.wz"))
+
+    def test_build_duplicate_path_raises(self, tmp_path):
+        img = WzImage.from_xml(
+            _make_xml_image("a.img", '<int name="x" value="1"/>'), version="gms")
+        with pytest.raises(ValueError, match="Duplicate"):
+            WzFile.build_to_file(
+                [("a.img", img.build()), ("a.img", img.build())],
+                str(tmp_path / "dup.wz"))
+
+    def test_dump_image_raw_byte_identical(self, tmp_path):
+        """dump_image_raw produces bytes that appear verbatim inside the WZ."""
+        img = WzImage.from_xml(
+            _make_xml_image("UIWindow.img", '<int name="hp" value="100"/>'), version="gms")
+        wz_path = tmp_path / "src.wz"
+        WzFile.build_to_file([("UI/UIWindow.img", img.build())], str(wz_path),
+                             version="gms", patch_version=83)
+
+        wz = WzFile.open(str(wz_path))
+        raw_path = tmp_path / "dumped.img"
+        n = wz.dump_image_raw("UI/UIWindow.img", str(raw_path))
+        assert n == raw_path.stat().st_size
+
+        wz_bytes = wz_path.read_bytes()
+        raw_bytes = raw_path.read_bytes()
+        assert raw_bytes in wz_bytes, "raw export should be byte-identical to in-WZ slice"
+
+        # And the slice must load as a standalone hotfix image (image-relative offsets).
+        loaded = WzImage.open(str(raw_path), version="gms")
+        assert loaded.get("hp").as_int() == 100
+
+    def test_dump_image_raw_missing(self, tmp_path):
+        img = WzImage.from_xml(
+            _make_xml_image("a.img", '<int name="x" value="1"/>'), version="gms")
+        wz_path = tmp_path / "src.wz"
+        WzFile.build_to_file([("a.img", img.build())], str(wz_path), version="gms")
+        wz = WzFile.open(str(wz_path))
+        with pytest.raises(KeyError, match="not found"):
+            wz.dump_image_raw("missing.img", str(tmp_path / "x.img"))
+
+    def test_evict_image(self, tmp_path):
+        """evict_image() drops cached parsed property trees."""
+        img = WzImage.from_xml(
+            _make_xml_image("a.img", '<int name="x" value="1"/>'), version="gms")
+        wz_path = tmp_path / "src.wz"
+        WzFile.build_to_file([("a.img", img.build())], str(wz_path), version="gms")
+        wz = WzFile.open(str(wz_path))
+        # Prime cache and evict; subsequent access still works (re-parses).
+        wz.image("a.img")
+        wz.evict_image("a.img")
+        assert wz.image("a.img").get("x").as_int() == 1
+        wz.image("a.img")
+        wz.evict_image()  # clear all
+        assert wz.image("a.img").get("x").as_int() == 1
+
+    def test_detect_version_static(self, tmp_path):
+        """WzFile.detect_version() returns the variant used to encrypt the file."""
+        img = WzImage.from_xml(
+            _make_xml_image("a.img", '<int name="x" value="1"/>'), version="gms")
+
+        gms_path = tmp_path / "gms.wz"
+        WzFile.build_to_file([("a.img", img.build())], str(gms_path), version="gms")
+        assert WzFile.detect_version(str(gms_path)) == "gms"
+
+        bms_img = WzImage.from_xml(
+            _make_xml_image("a.img", '<int name="x" value="1"/>'), version="bms")
+        bms_path = tmp_path / "bms.wz"
+        WzFile.build_to_file([("a.img", bms_img.build())], str(bms_path), version="bms")
+        assert WzFile.detect_version(str(bms_path)) == "bms"
+
+
+# ── CLI export / build integration ────────────────────────────────────────────
+
+
+def _build_test_wz(tmp_path) -> str:
+    """Helper: build a small synthetic WZ with subdirectory layout. Returns the path."""
+    img1 = WzImage.from_xml(
+        _make_xml_image("UIWindow.img",
+                        '<int name="hp" value="100"/><string name="title" value="hello"/>'),
+        version="gms")
+    img2 = WzImage.from_xml(
+        _make_xml_image("0100100.img", '<string name="name" value="Snail"/>'), version="gms")
+    out = tmp_path / "src.wz"
+    WzFile.build_to_file(
+        [("UI/UIWindow.img", img1.build()), ("Mob/0100100.img", img2.build())],
+        str(out), version="gms", patch_version=83)
+    return str(out)
+
+
+class TestCliRoundtrip:
+    """End-to-end: build → export → build → re-parse."""
+
+    def test_export_xml_then_build(self, tmp_path):
+        """Export to XML, rebuild, verify values preserved."""
+        from wzlib.cli import _collect_build_inputs
+        src_wz = _build_test_wz(tmp_path)
+
+        # Export via the Python API mirroring cmd_export
+        out_dir = tmp_path / "exp_xml"
+        out_dir.mkdir()
+        wz = WzFile.open(src_wz)
+        for img_path in wz.list_images():
+            parts = img_path.split("/")
+            target_dir = out_dir.joinpath(*parts[:-1]) if len(parts) > 1 else out_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            xml_str = wz.image(img_path).to_xml("client", parts[-1])
+            (target_dir / f"{parts[-1]}.xml").write_text(xml_str, encoding="utf-8")
+
+        # Rebuild via CLI helper
+        inputs = _collect_build_inputs(out_dir)
+        assert len(inputs) == 2
+        assert {wz_path for wz_path, _, _ in inputs} == {"UI/UIWindow.img", "Mob/0100100.img"}
+        assert all(kind == "xml" for _, _, kind in inputs)
+
+        entries = []
+        for wz_path, src_path, kind in inputs:
+            xml_str = src_path.read_text(encoding="utf-8")
+            img = WzImage.from_xml(xml_str, version="gms")
+            entries.append((wz_path, img.build()))
+        rebuilt_path = tmp_path / "rebuilt.wz"
+        WzFile.build_to_file(entries, str(rebuilt_path), version="gms", patch_version=83)
+
+        wz2 = WzFile.open(str(rebuilt_path))
+        assert wz2.image("UI/UIWindow.img").get("hp").as_int() == 100
+        assert wz2.image("UI/UIWindow.img").get("title").as_str() == "hello"
+        assert wz2.image("Mob/0100100.img").get("name").as_str() == "Snail"
+
+    def test_export_img_byte_identical_then_build(self, tmp_path):
+        """Export raw .img bytes, rebuild, verify byte-identical for unchanged images."""
+        from wzlib.cli import _collect_build_inputs
+        src_wz = _build_test_wz(tmp_path)
+
+        out_dir = tmp_path / "exp_img"
+        out_dir.mkdir()
+        wz = WzFile.open(src_wz)
+        for img_path in wz.list_images():
+            parts = img_path.split("/")
+            target_dir = out_dir.joinpath(*parts[:-1]) if len(parts) > 1 else out_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            wz.dump_image_raw(img_path, str(target_dir / parts[-1]))
+
+        inputs = _collect_build_inputs(out_dir)
+        assert all(kind == "img" for _, _, kind in inputs)
+
+        entries = [(wz_path, src_path.read_bytes()) for wz_path, src_path, _ in inputs]
+        rebuilt_path = tmp_path / "rebuilt.wz"
+        WzFile.build_to_file(entries, str(rebuilt_path), version="gms", patch_version=83)
+
+        # Original raw image bytes must appear verbatim in the rebuilt file too,
+        # since we wrote them through unchanged.
+        rebuilt = rebuilt_path.read_bytes()
+        for _, src_path, _ in inputs:
+            assert src_path.read_bytes() in rebuilt
+
+
+class TestCollectBuildInputsConflict:
+    """Tests for _collect_build_inputs same-name conflict handling."""
+
+    def test_xml_wins_over_img(self, tmp_path, capsys):
+        """When both X.img and X.img.xml exist, .xml wins and a warning is logged."""
+        from wzlib.cli import _collect_build_inputs
+        # Create a sibling .img and .img.xml in the same directory.
+        (tmp_path / "X.img").write_bytes(b"\x73\x00\x00")  # placeholder bytes
+        (tmp_path / "X.img.xml").write_text("<imgdir name='X.img'/>", encoding="utf-8")
+
+        inputs = _collect_build_inputs(tmp_path)
+        assert len(inputs) == 1
+        wz_path, src_path, kind = inputs[0]
+        assert wz_path == "X.img"
+        assert kind == "xml"
+        assert src_path.name == "X.img.xml"
+
+        captured = capsys.readouterr()
+        assert "conflict" in captured.err.lower()
+        assert "X.img" in captured.err
+
+    def test_xml_only_no_warning(self, tmp_path, capsys):
+        from wzlib.cli import _collect_build_inputs
+        (tmp_path / "X.img.xml").write_text("<imgdir name='X.img'/>", encoding="utf-8")
+        _collect_build_inputs(tmp_path)
+        captured = capsys.readouterr()
+        assert "conflict" not in captured.err.lower()
+
+    def test_img_only_no_warning(self, tmp_path, capsys):
+        from wzlib.cli import _collect_build_inputs
+        (tmp_path / "X.img").write_bytes(b"\x73\x00\x00")
+        _collect_build_inputs(tmp_path)
+        captured = capsys.readouterr()
+        assert "conflict" not in captured.err.lower()
+
+    def test_unrelated_files_skipped(self, tmp_path):
+        from wzlib.cli import _collect_build_inputs
+        (tmp_path / "X.img").write_bytes(b"\x73\x00\x00")
+        (tmp_path / "X.img.bak").write_bytes(b"backup")
+        (tmp_path / "README.md").write_text("ignore me")
+        inputs = _collect_build_inputs(tmp_path)
+        assert len(inputs) == 1
+        assert inputs[0][2] == "img"
+
+    def test_dfs_order_matches_build_expectations(self, tmp_path):
+        """Output order is DFS: each directory's images first, then its subdirs."""
+        from wzlib.cli import _collect_build_inputs
+        (tmp_path / "Mob").mkdir()
+        (tmp_path / "UI").mkdir()
+        (tmp_path / "UI" / "Sub").mkdir()
+        (tmp_path / "root.img.xml").write_text("<imgdir name='root.img'/>")
+        (tmp_path / "UI" / "UIWindow.img.xml").write_text("<imgdir name='UIWindow.img'/>")
+        (tmp_path / "UI" / "Sub" / "Deep.img.xml").write_text("<imgdir name='Deep.img'/>")
+        (tmp_path / "Mob" / "0100100.img.xml").write_text("<imgdir name='0100100.img'/>")
+
+        paths = [wz_path for wz_path, _, _ in _collect_build_inputs(tmp_path)]
+        # Images at the current level come before recursing into subdirs.
+        # Subdirs are visited in sorted order: Mob, UI; within UI, images then Sub.
+        assert paths == [
+            "root.img",
+            "Mob/0100100.img",
+            "UI/UIWindow.img",
+            "UI/Sub/Deep.img",
+        ]

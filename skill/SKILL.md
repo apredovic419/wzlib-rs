@@ -19,19 +19,23 @@ You have access to `wzltool`, a CLI for reading and writing MapleStory WZ and IM
 
 ## Encryption Versions
 
-Pass `--version` (`-V`) before the subcommand. Default is `bms`.
+Pass `--version` (`-V`) before the subcommand. Default is `auto` (auto-detects by trying each variant and picking the one with the highest printable-ASCII rate in directory/image names).
 
 | Version | Regions |
 |---------|---------|
-| `bms` | BMS, Classic, KMS, TMS, CMS (zero IV — works for most files) |
+| `auto` | Default — probe gms/ems/bms and pick the best fit |
+| `bms` | BMS, Classic, KMS, TMS, CMS (zero IV) |
 | `gms` | GMS |
 | `ems` | EMS, MSEA |
 
 ## Path Convention
 
-- **WZ archives**: paths start with the image name, e.g. `Mob/0100100.img/info/maxHP`
+- **WZ archives**: paths can include subdirectories. The image segment is identified by the rightmost component ending in `.img`. Property path follows.
+  - `Mob/0100100.img/info/maxHP` → image `Mob/0100100.img`, property `info/maxHP`
+  - `UI/Sub/Deep.img/x` → image `UI/Sub/Deep.img`, property `x`
 - **Standalone .img**: paths are property-relative, e.g. `info/maxHP`
-- Separator is `/`
+- **Directory listing**: `ls <wz> <dir-path>` (no `.img` suffix) lists immediate subdirs + images at that prefix.
+- Separator is `/`.
 
 ## Commands Reference
 
@@ -149,6 +153,53 @@ wzltool xml-import output.xml -o rebuilt.img
 - `--mode client`: binary data base64-encoded in `basedata` attributes. Enables round-trip.
 - The XML format matches the WzLib/HaRepacker convention used by server emulators.
 
+### Bulk export — `export`
+
+Walk a `.wz` and dump every image to a mirrored directory tree. Useful when you want to edit many images at once or diff/version-control the contents.
+
+```bash
+# XML export (default, client mode — binary data preserved)
+wzltool export <file.wz> -o <out_dir>
+
+# Raw IMG binary export (zero-loss, no XML parsing overhead)
+wzltool export <file.wz> -o <out_dir> --format img
+
+# Server-mode XML (smaller, metadata only — Canvas/Sound data dropped)
+wzltool export <file.wz> -o <out_dir> --format xml --mode server
+```
+
+Output mirrors the WZ folder structure:
+```
+out_dir/
+  UI/UIWindow.img.xml      (xml format)
+  Mob/0100100.img          (img format)
+```
+
+Defaults: `--format xml --mode client`. Progress is shown on stderr (single-line `\r`-overwrite when interactive).
+
+### Build a WZ from a directory tree — `build`
+
+Inverse of `export`: pack a directory of `.img` and/or `.img.xml` files into a complete WZ archive.
+
+```bash
+wzltool build <src_dir> -o <file.wz> [-e gms|ems|bms] [--patch-version N] [--64bit]
+```
+
+- Walks `src_dir` recursively. Files with `.img.xml` are parsed as WZ XML; files with `.img` are treated as already-serialized WZ image binaries (read verbatim).
+- **Mixed formats are allowed** — most images can stay as `.img` (fast) and only edited ones need to be `.img.xml`.
+- **Same-name conflict** (both `X.img` and `X.img.xml` present): `.xml` wins, a warning is logged to stderr.
+- Defaults: `-e gms`, `--patch-version 83`, 32-bit. Specify these explicitly to match the source file's region/version.
+
+Round-trip example (export → edit → rebuild):
+
+```bash
+wzltool export Custom.wz -o /tmp/dump
+# Edit /tmp/dump/UI/UIWindow.img.xml ...
+wzltool build /tmp/dump -o Custom.modified.wz -e gms --patch-version 83
+```
+
+Note: the rebuilt file is **structurally equivalent** to the original but **not byte-identical** (offsets and string-dedup order are recomputed).
+
 ### JSON mode
 
 Add `--json` before the subcommand for machine-readable output. All commands support it.
@@ -229,6 +280,22 @@ wzltool --json patch Mob.wz --ops '[
 wzltool add data.img "info/customFlag" 1 -t int -o data_modified.img
 ```
 
+### Bulk edit via export + build
+
+When making large or sweeping edits, the dump-edit-rebuild flow is often simpler than chaining `set` / `patch`:
+
+```bash
+# 1. Dump everything to XML
+wzltool export Custom.wz -o /tmp/dump
+
+# 2. Edit the XMLs in /tmp/dump (any text editor / scripted xmllint / sed)
+
+# 3. Repack
+wzltool build /tmp/dump -o Custom.modified.wz -e gms --patch-version 83
+```
+
+For partial edits, only the files you change need to be `.img.xml`; leave the rest as `.img` (export with `--format img` first to get them).
+
 ### Extract a sprite image
 
 ```bash
@@ -247,4 +314,5 @@ wzltool extract Sound.wz "BgmGL.img/Amoria" -o amoria.mp3
 - Use `-o` to write to a new file when the user hasn't explicitly asked to overwrite
 - For `.wz` archives, `save` re-serializes all images — this can be slow for large files
 - Canvas extraction to PNG requires Pillow (`pip install Pillow`); without it, raw RGBA is saved
-- The default encryption version `bms` (zero IV) works for most files; try `gms` or `ems` if parsing fails
+- The default encryption version is `auto` — it probes gms/ems/bms and picks the best fit; pass `-V <version>` only if auto-detection produces wrong results
+- `WzFile.detect_version(path)` (Python API) reads the file and returns the auto-detected variant name as a string

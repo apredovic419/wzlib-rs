@@ -9,9 +9,11 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use wzlib_rs::crypto::aes_encryption::generate_wz_key;
-use wzlib_rs::wz::directory::{WzDirectoryEntry, WzImageEntry};
+use wzlib_rs::wz::directory::{compute_image_checksum, WzDirectoryEntry, WzImageEntry};
+use wzlib_rs::wz::file::{compute_version_hash, detect_file_type, WzFileType};
+use wzlib_rs::wz::list_file::parse_list_file;
 use wzlib_rs::wz::properties::WzProperty;
-use wzlib_rs::wz::types::{WzMapleVersion, WzPngFormat};
+use wzlib_rs::wz::types::{WzDirectoryType, WzMapleVersion, WzPngFormat};
 use wzlib_rs::{
     WzBinaryReader, WzFile, WzHeader,
     compress_png_data, decode_pixels, decompress_png_data, encode_pixels,
@@ -34,6 +36,103 @@ fn version_to_maple(version: &str) -> PyResult<WzMapleVersion> {
 
 fn version_to_iv(version: &str) -> PyResult<[u8; 4]> {
     Ok(version_to_maple(version)?.iv())
+}
+
+// ── Auto-detection of encryption variant ─────────────────────────────
+//
+// Tries each candidate variant (gms, ems, bms) and picks the one whose
+// parsed names have the highest printable-ASCII rate. Mirrors the WASM
+// `detectWzMapleVersion` heuristic so the CLI matches the demo's behavior.
+//
+// Tie-breaking: we use strict `>`, so on a perfect tie the first candidate
+// wins. Order is gms → ems → bms, so degenerate / empty inputs deterministically
+// resolve to "gms". Reorder this array only with care.
+
+const CANDIDATES: [(&str, WzMapleVersion); 3] = [
+    ("gms", WzMapleVersion::Gms),
+    ("ems", WzMapleVersion::Ems),
+    ("bms", WzMapleVersion::Bms),
+];
+
+// A printable-rate this high means the variant is certainly correct;
+// stop probing remaining candidates. Saves ~2/3 of the WzFile::parse work
+// in the common case (which includes a brute-force patch-version sweep
+// of 0..2000 per candidate).
+const DETECT_EARLY_STOP_RATE: f64 = 0.95;
+
+// Below this rate we still return an answer but warn — likely an unknown
+// variant or a custom IV that none of gms/ems/bms can decode cleanly.
+const DETECT_LOW_CONFIDENCE_RATE: f64 = 0.5;
+
+fn printable_rate<'a>(names: impl Iterator<Item = &'a str>) -> f64 {
+    let (mut recognized, mut total) = (0usize, 0usize);
+    for name in names {
+        for c in name.chars() {
+            if ('\x20'..='\x7E').contains(&c) { recognized += 1; }
+        }
+        total += name.chars().count();
+    }
+    if total == 0 { 0.0 } else { recognized as f64 / total as f64 }
+}
+
+fn detect_maple_version(raw: &[u8]) -> PyResult<&'static str> {
+    let kind = detect_file_type(raw);
+    let mut best: Option<(&'static str, f64)> = None;
+
+    for (name, mv) in &CANDIDATES {
+        let rate = match kind {
+            WzFileType::Standard => match WzFile::parse(raw, *mv, None) {
+                Ok(f) => printable_rate(
+                    f.directory.subdirectories.iter().map(|s| s.name.as_str())
+                        .chain(f.directory.images.iter().map(|i| i.name.as_str())),
+                ),
+                Err(_) => continue,
+            },
+            WzFileType::HotfixDataWz => match parse_hotfix_data_wz(raw, mv.iv()) {
+                Ok(props) => printable_rate(props.iter().map(|(n, _)| n.as_str())),
+                Err(_) => continue,
+            },
+            WzFileType::ListFile => match parse_list_file(raw, *mv) {
+                Ok(entries) => printable_rate(entries.iter().map(|s| s.as_str())),
+                Err(_) => continue,
+            },
+        };
+        if best.as_ref().is_none_or(|(_, br)| rate > *br) {
+            best = Some((name, rate));
+        }
+        if rate >= DETECT_EARLY_STOP_RATE { break; }
+    }
+
+    let (name, rate) = best.ok_or_else(|| PyRuntimeError::new_err(
+        "Could not auto-detect WZ encryption variant. Try passing -V gms/ems/bms explicitly."
+    ))?;
+
+    if rate < DETECT_LOW_CONFIDENCE_RATE {
+        eprintln!(
+            "warning: low-confidence encryption detection (rate={:.2}, picked '{}'). \
+             File may use a custom IV; pass -V explicitly if results look wrong.",
+            rate, name
+        );
+    }
+    Ok(name)
+}
+
+fn resolve_version(version: &str, raw: &[u8]) -> PyResult<&'static str> {
+    if version.eq_ignore_ascii_case("auto") {
+        detect_maple_version(raw)
+    } else {
+        // Validate by round-tripping through version_to_maple, then map back
+        // to the canonical lowercase name.
+        match version.to_lowercase().as_str() {
+            "gms" => Ok("gms"),
+            "ems" | "msea" => Ok("ems"),
+            "bms" | "classic" => Ok("bms"),
+            other => Err(PyValueError::new_err(format!(
+                "Unknown version '{}'. Use 'auto', 'gms', 'ems'/'msea', or 'bms'/'classic'.",
+                other
+            ))),
+        }
+    }
 }
 
 fn parse_xml_mode(mode: &str) -> PyResult<wzlib_rs::XmlMode> {
@@ -475,6 +574,107 @@ fn populate_directory_fast(
     }
 
     Ok(())
+}
+
+// ── Build-from-scratch ───────────────────────────────────────────────
+//
+// Group flat (path, bytes) entries into a `WzDirectoryEntry` tree, attach
+// raw image data, then call `WzFile::save_with_image_data`. This is the
+// build-from-scratch counterpart to `populate_directory_fast`, which only
+// works on an existing parsed tree.
+
+/// Insert one image into the tree, creating subdirectories as needed.
+fn insert_image_path(
+    tree: &mut WzDirectoryEntry,
+    parts: &[&str],
+    bytes: Vec<u8>,
+) -> PyResult<()> {
+    let (leaf, dirs) = parts.split_last()
+        .ok_or_else(|| PyValueError::new_err("Empty image path"))?;
+    let mut cur = tree;
+    for d in dirs {
+        let idx = match cur.subdirectories.iter().position(|s| s.name == *d) {
+            Some(i) => i,
+            None => {
+                cur.subdirectories.push(WzDirectoryEntry::new(
+                    d.to_string(),
+                    WzDirectoryType::Directory as u8,
+                ));
+                cur.subdirectories.len() - 1
+            }
+        };
+        cur = &mut cur.subdirectories[idx];
+    }
+    if cur.images.iter().any(|i| i.name == *leaf) {
+        return Err(PyValueError::new_err(format!(
+            "Duplicate image path in build entries: '{}'", parts.join("/")
+        )));
+    }
+    cur.images.push(WzImageEntry {
+        name: leaf.to_string(),
+        size: bytes.len() as i32,
+        checksum: compute_image_checksum(&bytes),
+        offset: 0,
+        properties: None,
+        raw_data: Some(bytes),
+        iv: None,
+    });
+    Ok(())
+}
+
+/// Walk the tree depth-first (images first per node, then subdirs), collecting
+/// owned image bytes. Order must match `attach_image_data` / `save_with_image_data`.
+fn drain_image_data(tree: &mut WzDirectoryEntry, out: &mut Vec<Vec<u8>>) {
+    for img in tree.images.iter_mut() {
+        out.push(img.raw_data.take().unwrap_or_default());
+    }
+    for sub in tree.subdirectories.iter_mut() {
+        drain_image_data(sub, out);
+    }
+}
+
+fn build_wz_bytes(
+    entries: Vec<(String, Vec<u8>)>,
+    version: &str,
+    patch_version: i16,
+    is_64bit: bool,
+) -> PyResult<Vec<u8>> {
+    let maple = version_to_maple(version)?;
+    if entries.is_empty() {
+        return Err(PyValueError::new_err("Cannot build WZ file with zero images"));
+    }
+
+    let mut root = WzDirectoryEntry::new(String::new(), WzDirectoryType::Directory as u8);
+    for (path, bytes) in entries {
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return Err(PyValueError::new_err(format!("Invalid empty path: '{}'", path)));
+        }
+        insert_image_path(&mut root, &parts, bytes)?;
+    }
+
+    let mut owned_blobs: Vec<Vec<u8>> = Vec::new();
+    drain_image_data(&mut root, &mut owned_blobs);
+    let blob_refs: Vec<&[u8]> = owned_blobs.iter().map(|v| v.as_slice()).collect();
+
+    let mut wz_file = WzFile {
+        header: WzHeader {
+            ident: "PKG1".into(),
+            file_size: 0,
+            data_start: 60,
+            copyright: "Package file v1.0 Copyright 2002 Wizet, ZMS".into(),
+        },
+        version: patch_version,
+        version_hash: compute_version_hash(patch_version),
+        maple_version: maple,
+        iv: maple.iv(),
+        user_key: None,
+        is_64bit,
+        directory: root,
+    };
+
+    wz_file.save_with_image_data(&blob_refs)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 // ── _outlink canvas resolution ────────────────────────────────────────
@@ -981,21 +1181,25 @@ pub struct WzImage {
 #[pymethods]
 impl WzImage {
     /// Open a standalone img file (hotfix Data.wz or any bare WzImage binary).
+    /// `version`: "auto" (default), "gms", "ems"/"msea", or "bms"/"classic".
     #[staticmethod]
-    #[pyo3(signature = (path, version = "bms"))]
+    #[pyo3(signature = (path, version = "auto"))]
     fn open(path: &str, version: &str) -> PyResult<Self> {
-        let iv = version_to_iv(version)?;
         let raw = std::fs::read(path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let resolved = resolve_version(version, &raw)?;
+        let iv = version_to_iv(resolved)?;
         let props = parse_hotfix_data_wz(&raw, iv)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { props: Arc::new(RwLock::new(props)), iv, file_path: Some(Arc::new(PathBuf::from(path))) })
     }
 
     /// Parse a WzImage from raw bytes.
+    /// `version`: "auto" (default), "gms", "ems"/"msea", or "bms"/"classic".
     #[staticmethod]
-    #[pyo3(signature = (data, version = "bms"))]
+    #[pyo3(signature = (data, version = "auto"))]
     fn from_bytes(data: &[u8], version: &str) -> PyResult<Self> {
-        let iv = version_to_iv(version)?;
+        let resolved = resolve_version(version, data)?;
+        let iv = version_to_iv(resolved)?;
         let props = parse_hotfix_data_wz(data, iv)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { props: Arc::new(RwLock::new(props)), iv, file_path: None })
@@ -1170,13 +1374,14 @@ pub struct PyWzFile {
 #[pymethods]
 impl PyWzFile {
     /// Open a standard PKG1 WZ file.
-    /// `version`: "gms", "ems"/"msea", or "bms"/"classic" (default "bms").
+    /// `version`: "auto" (default), "gms", "ems"/"msea", or "bms"/"classic".
     /// `patch_version`: supply the known patch version to skip brute-force detection.
     #[staticmethod]
-    #[pyo3(signature = (path, version = "bms", patch_version = None))]
+    #[pyo3(signature = (path, version = "auto", patch_version = None))]
     fn open(path: &str, version: &str, patch_version: Option<i16>) -> PyResult<Self> {
-        let maple = version_to_maple(version)?;
         let raw = std::fs::read(path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let resolved = resolve_version(version, &raw)?;
+        let maple = version_to_maple(resolved)?;
         let wz = WzFile::parse(&raw, maple, patch_version)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self {
@@ -1187,6 +1392,41 @@ impl PyWzFile {
                 file_path: Some(Arc::new(PathBuf::from(path))),
             })),
         })
+    }
+
+    /// Auto-detect the encryption variant for a WZ/IMG/List file.
+    /// Returns "gms", "ems", or "bms".
+    #[staticmethod]
+    fn detect_version(path: &str) -> PyResult<String> {
+        let raw = std::fs::read(path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(detect_maple_version(&raw)?.to_string())
+    }
+
+    /// Build a complete WZ file from a flat list of `(path, image_bytes)` entries.
+    ///
+    /// Each `path` is a slash-separated WZ path like `"UIWindow.img"` or
+    /// `"UI/Sub/X.img"`. `image_bytes` are the pre-serialized WZ image binaries
+    /// (i.e. what `WzImage.build()` / `save_hotfix_data_wz` produces).
+    ///
+    /// Writes the resulting WZ file to `output_path` and returns its size in bytes.
+    /// Defaults: GMS encryption, patch version 83, 32-bit format.
+    #[staticmethod]
+    #[pyo3(signature = (
+        entries, output_path,
+        version = "gms", patch_version = 83, is_64bit = false,
+    ))]
+    fn build_to_file(
+        entries: Vec<(String, Vec<u8>)>,
+        output_path: &str,
+        version: &str,
+        patch_version: i16,
+        is_64bit: bool,
+    ) -> PyResult<u64> {
+        let bytes = build_wz_bytes(entries, version, patch_version, is_64bit)?;
+        let len = bytes.len() as u64;
+        std::fs::write(output_path, &bytes)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(len)
     }
 
     /// All image paths in depth-first order, e.g. ["0100000.img", "Mob/0100100.img"].
@@ -1229,6 +1469,43 @@ impl PyWzFile {
             .entry(name.to_string())
             .or_insert_with(|| Arc::clone(&props_arc));
         Ok(WzImage { props: Arc::clone(cached), iv, file_path })
+    }
+
+    /// Drop the cached parsed property tree for a single image (or all images
+    /// when `name` is `None`). Use this in bulk-export loops to keep memory
+    /// bounded; the next `image(name)` call will re-parse from raw bytes.
+    #[pyo3(signature = (name = None))]
+    fn evict_image(&self, name: Option<&str>) -> PyResult<()> {
+        let mut guard = self.inner.lock().map_err(|_| lock_err())?;
+        match name {
+            Some(n) => { guard.image_cache.remove(n); }
+            None => { guard.image_cache.clear(); }
+        }
+        Ok(())
+    }
+
+    /// Write an image's raw on-disk bytes directly to `output_path`, without
+    /// parsing or re-serializing. The slice is the same property-tree binary
+    /// the WZ archive contains, which is also a valid hotfix `.img` (string
+    /// offsets within the slice are image-relative, so they resolve correctly
+    /// when the slice is loaded standalone via `WzImage.open`).
+    /// Returns the number of bytes written.
+    fn dump_image_raw(&self, name: &str, output_path: &str) -> PyResult<u64> {
+        let guard = self.inner.lock().map_err(|_| lock_err())?;
+        let entry = find_image_entry(&guard.wz.directory, name)
+            .ok_or_else(|| PyKeyError::new_err(format!("Image not found: '{}'", name)))?;
+        let start = entry.offset as usize;
+        let end = start.saturating_add(entry.size.max(0) as usize);
+        if end > guard.raw.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "Image '{}' offset {} + size {} exceeds file length {}",
+                name, start, entry.size, guard.raw.len()
+            )));
+        }
+        let slice = &guard.raw[start..end];
+        std::fs::write(output_path, slice)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(slice.len() as u64)
     }
 
     /// All images (including unmodified ones) are read and re-serialized.
