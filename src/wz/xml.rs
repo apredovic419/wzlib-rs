@@ -96,7 +96,11 @@ fn write_prop(out: &mut String, name: &str, prop: &WzProperty, mode: &XmlMode, d
             out.push_str("<float name=\"");
             xml_escape_into(out, name);
             out.push_str("\" value=\"");
-            let s = if v.is_finite() { v.to_string() } else { "0".to_string() };
+            let s = if v.is_finite() {
+                v.to_string()
+            } else {
+                "0".to_string()
+            };
             out.push_str(&s);
             out.push_str("\"/>\n");
         }
@@ -105,7 +109,11 @@ fn write_prop(out: &mut String, name: &str, prop: &WzProperty, mode: &XmlMode, d
             out.push_str("<double name=\"");
             xml_escape_into(out, name);
             out.push_str("\" value=\"");
-            let s = if v.is_finite() { v.to_string() } else { "0".to_string() };
+            let s = if v.is_finite() {
+                v.to_string()
+            } else {
+                "0".to_string()
+            };
             out.push_str(&s);
             out.push_str("\"/>\n");
         }
@@ -150,7 +158,13 @@ fn write_prop(out: &mut String, name: &str, prop: &WzProperty, mode: &XmlMode, d
                 out.push_str("</imgdir>\n");
             }
         }
-        WzProperty::Canvas { width, height, format, properties, png_data } => {
+        WzProperty::Canvas {
+            width,
+            height,
+            format,
+            properties,
+            png_data,
+        } => {
             indent(out, depth);
             out.push_str("<canvas name=\"");
             xml_escape_into(out, name);
@@ -193,7 +207,11 @@ fn write_prop(out: &mut String, name: &str, prop: &WzProperty, mode: &XmlMode, d
                 out.push_str("</convex>\n");
             }
         }
-        WzProperty::Sound { duration_ms, header, data } => {
+        WzProperty::Sound {
+            duration_ms,
+            header,
+            data,
+        } => {
             indent(out, depth);
             out.push_str("<sound name=\"");
             xml_escape_into(out, name);
@@ -220,7 +238,11 @@ fn write_prop(out: &mut String, name: &str, prop: &WzProperty, mode: &XmlMode, d
             }
             out.push_str("/>\n");
         }
-        WzProperty::RawData { raw_type, properties, data } => {
+        WzProperty::RawData {
+            raw_type,
+            properties,
+            data,
+        } => {
             indent(out, depth);
             out.push_str("<rawdata name=\"");
             xml_escape_into(out, name);
@@ -243,7 +265,12 @@ fn write_prop(out: &mut String, name: &str, prop: &WzProperty, mode: &XmlMode, d
                 out.push_str("</rawdata>\n");
             }
         }
-        WzProperty::Video { video_type, properties, data_length, .. } => {
+        WzProperty::Video {
+            video_type,
+            properties,
+            data_length,
+            ..
+        } => {
             // Video binary data is always omitted — it's too large and rarely useful
             indent(out, depth);
             out.push_str("<video name=\"");
@@ -319,12 +346,12 @@ pub fn import_wz_xml(xml: &str) -> WzResult<(String, Vec<(String, WzProperty)>)>
             "long" => Some(WzProperty::Long(
                 attrs.get("value").and_then(|s| s.parse().ok()).unwrap_or(0),
             )),
-            "float" => Some(WzProperty::Float(
-                parse_float(attrs.get("value").map(|s| s.as_str()).unwrap_or("0")) as f32,
-            )),
-            "double" => Some(WzProperty::Double(
-                parse_float(attrs.get("value").map(|s| s.as_str()).unwrap_or("0")),
-            )),
+            "float" => Some(WzProperty::Float(parse_float(
+                attrs.get("value").map(|s| s.as_str()).unwrap_or("0"),
+            ) as f32)),
+            "double" => Some(WzProperty::Double(parse_float(
+                attrs.get("value").map(|s| s.as_str()).unwrap_or("0"),
+            ))),
             "string" => Some(WzProperty::String(
                 attrs.get("value").cloned().unwrap_or_default(),
             )),
@@ -335,28 +362,53 @@ pub fn import_wz_xml(xml: &str) -> WzResult<(String, Vec<(String, WzProperty)>)>
                 x: attrs.get("x").and_then(|s| s.parse().ok()).unwrap_or(0),
                 y: attrs.get("y").and_then(|s| s.parse().ok()).unwrap_or(0),
             }),
-            "imgdir" => Some(WzProperty::SubProperty { properties: Vec::new() }),
+            "imgdir" => Some(WzProperty::SubProperty {
+                properties: Vec::new(),
+            }),
             "canvas" => {
                 let width = attrs.get("width").and_then(|s| s.parse().ok()).unwrap_or(0);
-                let height = attrs.get("height").and_then(|s| s.parse().ok()).unwrap_or(0);
+                let height = attrs
+                    .get("height")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
                 let (format, png_data) = canvas_from_basedata(attrs, width, height);
-                Some(WzProperty::Canvas { width, height, format, properties: Vec::new(), png_data })
+                Some(WzProperty::Canvas {
+                    width,
+                    height,
+                    format,
+                    properties: Vec::new(),
+                    png_data,
+                })
             }
             "convex" => Some(WzProperty::Convex { points: Vec::new() }),
             "sound" => {
-                let duration_ms = attrs.get("duration").and_then(|s| s.parse().ok()).unwrap_or(0);
+                let duration_ms = attrs
+                    .get("duration")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
                 let (header, data) = unpack_sound_from_attrs(attrs);
-                Some(WzProperty::Sound { duration_ms, header, data })
+                Some(WzProperty::Sound {
+                    duration_ms,
+                    header,
+                    data,
+                })
             }
             "lua" => Some(WzProperty::Lua(decode_b64_attr(attrs, "basedata"))),
             "rawdata" => {
                 let raw_type = attrs.get("type").and_then(|s| s.parse().ok()).unwrap_or(0);
                 let data = decode_b64_attr(attrs, "basedata");
-                Some(WzProperty::RawData { raw_type, properties: Vec::new(), data })
+                Some(WzProperty::RawData {
+                    raw_type,
+                    properties: Vec::new(),
+                    data,
+                })
             }
             "video" => {
                 let video_type = attrs.get("type").and_then(|s| s.parse().ok()).unwrap_or(0);
-                let data_length = attrs.get("dataLength").and_then(|s| s.parse().ok()).unwrap_or(0);
+                let data_length = attrs
+                    .get("dataLength")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
                 Some(WzProperty::Video {
                     video_type,
                     properties: Vec::new(),
@@ -372,11 +424,29 @@ pub fn import_wz_xml(xml: &str) -> WzResult<(String, Vec<(String, WzProperty)>)>
 
     // Stack entries: what's currently open on the XML element stack.
     enum Frame {
-        ImgDir { name: String },
-        Canvas { name: String, width: i32, height: i32, format: WzPngFormat, png_data: Vec<u8> },
-        Convex { name: String },
-        RawData { name: String, raw_type: u8, data: Vec<u8> },
-        Video { name: String, video_type: u8, data_length: u32 },
+        ImgDir {
+            name: String,
+        },
+        Canvas {
+            name: String,
+            width: i32,
+            height: i32,
+            format: WzPngFormat,
+            png_data: Vec<u8>,
+        },
+        Convex {
+            name: String,
+        },
+        RawData {
+            name: String,
+            raw_type: u8,
+            data: Vec<u8>,
+        },
+        Video {
+            name: String,
+            video_type: u8,
+            data_length: u32,
+        },
     }
 
     let mut reader = Reader::from_str(xml);
@@ -400,11 +470,19 @@ pub fn import_wz_xml(xml: &str) -> WzResult<(String, Vec<(String, WzProperty)>)>
                     }
                     "canvas" => {
                         let width = attrs.get("width").and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let height =
-                            attrs.get("height").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let height = attrs
+                            .get("height")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
                         let (fmt, png_data) = canvas_from_basedata(&attrs, width, height);
                         stack.push((
-                            Frame::Canvas { name, width, height, format: fmt, png_data },
+                            Frame::Canvas {
+                                name,
+                                width,
+                                height,
+                                format: fmt,
+                                png_data,
+                            },
                             Vec::new(),
                         ));
                     }
@@ -412,17 +490,32 @@ pub fn import_wz_xml(xml: &str) -> WzResult<(String, Vec<(String, WzProperty)>)>
                         stack.push((Frame::Convex { name }, Vec::new()));
                     }
                     "rawdata" => {
-                        let raw_type =
-                            attrs.get("type").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let raw_type = attrs.get("type").and_then(|s| s.parse().ok()).unwrap_or(0);
                         let data = decode_b64_attr(&attrs, "basedata");
-                        stack.push((Frame::RawData { name, raw_type, data }, Vec::new()));
+                        stack.push((
+                            Frame::RawData {
+                                name,
+                                raw_type,
+                                data,
+                            },
+                            Vec::new(),
+                        ));
                     }
                     "video" => {
                         let video_type =
                             attrs.get("type").and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let data_length =
-                            attrs.get("dataLength").and_then(|s| s.parse().ok()).unwrap_or(0);
-                        stack.push((Frame::Video { name, video_type, data_length }, Vec::new()));
+                        let data_length = attrs
+                            .get("dataLength")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        stack.push((
+                            Frame::Video {
+                                name,
+                                video_type,
+                                data_length,
+                            },
+                            Vec::new(),
+                        ));
                     }
                     _ => {}
                 }
@@ -457,27 +550,47 @@ pub fn import_wz_xml(xml: &str) -> WzResult<(String, Vec<(String, WzProperty)>)>
                                 result = children;
                                 continue;
                             }
-                            (name, WzProperty::SubProperty { properties: children })
-                        }
-                        Frame::Canvas { name, width, height, format, png_data } => {
                             (
                                 name,
-                                WzProperty::Canvas {
-                                    width,
-                                    height,
-                                    format,
+                                WzProperty::SubProperty {
                                     properties: children,
-                                    png_data,
                                 },
                             )
                         }
-                        Frame::Convex { name } => {
-                            (name, WzProperty::Convex { points: children })
-                        }
-                        Frame::RawData { name, raw_type, data } => {
-                            (name, WzProperty::RawData { raw_type, properties: children, data })
-                        }
-                        Frame::Video { name, video_type, data_length } => (
+                        Frame::Canvas {
+                            name,
+                            width,
+                            height,
+                            format,
+                            png_data,
+                        } => (
+                            name,
+                            WzProperty::Canvas {
+                                width,
+                                height,
+                                format,
+                                properties: children,
+                                png_data,
+                            },
+                        ),
+                        Frame::Convex { name } => (name, WzProperty::Convex { points: children }),
+                        Frame::RawData {
+                            name,
+                            raw_type,
+                            data,
+                        } => (
+                            name,
+                            WzProperty::RawData {
+                                raw_type,
+                                properties: children,
+                                data,
+                            },
+                        ),
+                        Frame::Video {
+                            name,
+                            video_type,
+                            data_length,
+                        } => (
                             name,
                             WzProperty::Video {
                                 video_type,
@@ -702,20 +815,22 @@ mod tests {
 
     #[test]
     fn test_export_empty_subproperty() {
-        let props = vec![
-            ("stop".to_string(), WzProperty::SubProperty { properties: vec![
-                ("0".to_string(), WzProperty::SubProperty { properties: vec![] }),
-            ]}),
-        ];
+        let props = vec![(
+            "stop".to_string(),
+            WzProperty::SubProperty {
+                properties: vec![(
+                    "0".to_string(),
+                    WzProperty::SubProperty { properties: vec![] },
+                )],
+            },
+        )];
         let xml = export_wz_xml("test.img", &props, &XmlMode::MetadataOnly);
         assert!(xml.contains("<imgdir name=\"0\"/>"));
     }
 
     #[test]
     fn test_export_xml_escape() {
-        let props = vec![
-            ("a&b".to_string(), WzProperty::String("val<>\"".to_string())),
-        ];
+        let props = vec![("a&b".to_string(), WzProperty::String("val<>\"".to_string()))];
         let xml = export_wz_xml("test.img", &props, &XmlMode::MetadataOnly);
         assert!(xml.contains("name=\"a&amp;b\""));
         assert!(xml.contains("value=\"val&lt;&gt;&quot;\""));
@@ -782,7 +897,10 @@ mod tests {
             panic!("Expected SubProperty");
         }
         assert!(matches!(&imported[1].1, WzProperty::Int(120)));
-        assert!(matches!(&imported[2].1, WzProperty::Vector { x: -36, y: 100 }));
+        assert!(matches!(
+            &imported[2].1,
+            WzProperty::Vector { x: -36, y: 100 }
+        ));
         assert!(matches!(&imported[3].1, WzProperty::Short(1)));
     }
 
@@ -791,7 +909,7 @@ mod tests {
         use crate::image::encode as image_encode;
 
         // Build a valid 2×1 Bgra8888 canvas: 2 pixels × 4 bytes, zlib-compressed.
-        let rgba = vec![255u8, 0, 0, 255,  0, 255, 0, 255]; // red, green
+        let rgba = vec![255u8, 0, 0, 255, 0, 255, 0, 255]; // red, green
         let wz_pixels = image_encode::encode_pixels(&rgba, 2, 1, WzPngFormat::Bgra8888).unwrap();
         let png_data = image_encode::compress_png_data(&wz_pixels).unwrap();
 
@@ -801,9 +919,7 @@ mod tests {
                 width: 2,
                 height: 1,
                 format: WzPngFormat::Bgra8888,
-                properties: vec![
-                    ("origin".to_string(), WzProperty::Vector { x: 5, y: 10 }),
-                ],
+                properties: vec![("origin".to_string(), WzProperty::Vector { x: 5, y: 10 })],
                 png_data,
             },
         )];
@@ -814,15 +930,21 @@ mod tests {
 
         // basedata is a standard PNG (magic bytes: 89 50 4E 47)
         let b64_start = xml.find("basedata=\"").unwrap() + 10;
-        let b64_end   = xml[b64_start..].find('"').unwrap() + b64_start;
+        let b64_end = xml[b64_start..].find('"').unwrap() + b64_start;
         let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&xml[b64_start..b64_end]).unwrap();
+            .decode(&xml[b64_start..b64_end])
+            .unwrap();
         assert_eq!(&decoded[..4], b"\x89PNG", "basedata must be a standard PNG");
 
         // Roundtrip: import → Canvas preserved
         let (_, imported) = import_wz_xml(&xml).unwrap();
-        if let WzProperty::Canvas { width, height, format, properties, png_data: got_png } =
-            &imported[0].1
+        if let WzProperty::Canvas {
+            width,
+            height,
+            format,
+            properties,
+            png_data: got_png,
+        } = &imported[0].1
         {
             assert_eq!(*width, 2);
             assert_eq!(*height, 1);
