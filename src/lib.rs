@@ -6,7 +6,7 @@ pub mod wz;
 mod wasm_api;
 
 pub use image::encode::{compress_png_data, encode_pixels};
-pub use image::{decode_pixels, decompress_png_data};
+pub use image::{decode_canvas_pixels, decode_pixels, decompress_png_data};
 pub use wz::binary_reader::WzBinaryReader;
 pub use wz::binary_writer::WzBinaryWriter;
 pub use wz::directory::{WzDirectoryEntry, WzImageEntry};

@@ -64,6 +64,51 @@ pub fn decode_pixels(
     }
 }
 
+/// Decode a canvas's decompressed bytes to RGBA8888, honoring the WZ scale
+/// exponent (`format2`).
+///
+/// When `scale == 0` this is exactly [`decode_pixels`]. When `scale > 0` the
+/// pixel data is stored at `(width >> scale) × (height >> scale)` (the reduced
+/// resolution the compressed `raw` actually contains) and is then
+/// nearest-neighbor upscaled to the full `(width, height)`. This matches the
+/// official v83 client, where solid-color / gradient fill layers (sky, water,
+/// flat backgrounds) are stored downscaled to save space.
+pub fn decode_canvas_pixels(
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    scale: u8,
+    format: WzPngFormat,
+) -> WzResult<Vec<u8>> {
+    if scale == 0 {
+        return decode_pixels(raw, width, height, format);
+    }
+    let sw = (width >> scale).max(1);
+    let sh = (height >> scale).max(1);
+    let small = decode_pixels(raw, sw, sh, format)?;
+    Ok(nearest_upscale(&small, sw, sh, width, height))
+}
+
+/// Nearest-neighbor upscale of an RGBA8888 buffer from `(sw, sh)` to `(dw, dh)`.
+fn nearest_upscale(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
+    if sw == 0 || sh == 0 {
+        return out;
+    }
+    for y in 0..dh {
+        let sy = ((y * sh) / dh).min(sh - 1);
+        for x in 0..dw {
+            let sx = ((x * sw) / dw).min(sw - 1);
+            let si = ((sy * sw + sx) as usize) * 4;
+            let di = ((y * dw + x) as usize) * 4;
+            if si + 4 <= src.len() {
+                out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+    }
+    out
+}
+
 pub fn decompress_png_data(compressed: &[u8], wz_key: Option<&[u8]>) -> WzResult<Vec<u8>> {
     use flate2::read::{DeflateDecoder, ZlibDecoder};
     use std::io::{Cursor, Read};
@@ -156,6 +201,52 @@ mod tests {
         assert_eq!(&result[0..4], &[255, 255, 255, 0]);
         // Pixel 2: R=255, G=255, B=255, A=255
         assert_eq!(&result[8..12], &[255, 255, 255, 255]);
+    }
+
+    // ── decode_canvas_pixels (scale exponent) ─────────────────────────
+
+    #[test]
+    fn test_decode_canvas_scale0_equals_decode_pixels() {
+        let raw = vec![0xFF; 2 * 2 * 4];
+        let a = decode_canvas_pixels(&raw, 2, 2, 0, WzPngFormat::Bgra8888).unwrap();
+        let b = decode_pixels(&raw, 2, 2, WzPngFormat::Bgra8888).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_decode_canvas_scale_upscales_nearest() {
+        // 2×2 source stored, scale=1 → upscale to 4×4. BGRA8888 distinct pixels:
+        // (0,0)=red (1,0)=green (0,1)=blue (1,1)=white. Bytes are B,G,R,A.
+        let raw = vec![
+            0x00, 0x00, 0xFF, 0xFF, // px(0,0) red
+            0x00, 0xFF, 0x00, 0xFF, // px(1,0) green
+            0xFF, 0x00, 0x00, 0xFF, // px(0,1) blue
+            0xFF, 0xFF, 0xFF, 0xFF, // px(1,1) white
+        ];
+        let out = decode_canvas_pixels(&raw, 4, 4, 1, WzPngFormat::Bgra8888).unwrap();
+        assert_eq!(out.len(), 4 * 4 * 4);
+        let px = |x: usize, y: usize| {
+            let i = (y * 4 + x) * 4;
+            &out[i..i + 4]
+        };
+        // top-left 2×2 block = red (RGBA after BGRA swap)
+        assert_eq!(px(0, 0), &[0xFF, 0x00, 0x00, 0xFF]);
+        assert_eq!(px(1, 1), &[0xFF, 0x00, 0x00, 0xFF]);
+        // top-right 2×2 block = green
+        assert_eq!(px(2, 0), &[0x00, 0xFF, 0x00, 0xFF]);
+        assert_eq!(px(3, 1), &[0x00, 0xFF, 0x00, 0xFF]);
+        // bottom-left = blue, bottom-right = white
+        assert_eq!(px(0, 2), &[0x00, 0x00, 0xFF, 0xFF]);
+        assert_eq!(px(3, 3), &[0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_decode_canvas_midforest_shape() {
+        // Real midForest case: RGB565 (513) stored at 8×8, scale=4 → 128×128.
+        // 8×8 RGB565 = 128 bytes; upscaled RGBA = 128*128*4.
+        let raw = vec![0u8; 8 * 8 * 2];
+        let out = decode_canvas_pixels(&raw, 128, 128, 4, WzPngFormat::Rgb565).unwrap();
+        assert_eq!(out.len(), 128 * 128 * 4);
     }
 
     #[test]

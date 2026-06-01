@@ -162,6 +162,7 @@ fn write_prop(out: &mut String, name: &str, prop: &WzProperty, mode: &XmlMode, d
             width,
             height,
             format,
+            scale,
             properties,
             png_data,
         } => {
@@ -175,7 +176,11 @@ fn write_prop(out: &mut String, name: &str, prop: &WzProperty, mode: &XmlMode, d
             out.push_str("\"");
             if let XmlMode::WithBinaryData = mode {
                 // Decode WZ pixels → RGBA8888 → standard PNG (HaRepacker-compatible).
-                if let Ok(png_bytes) = canvas_to_standard_png(*width, *height, *format, png_data) {
+                // The exported PNG is full-resolution (scale already applied), so
+                // re-import yields a scale-0 canvas carrying the same image.
+                if let Ok(png_bytes) =
+                    canvas_to_standard_png(*width, *height, *scale, *format, png_data)
+                {
                     out.push_str(" basedata=\"");
                     out.push_str(&base64::engine::general_purpose::STANDARD.encode(&png_bytes));
                     out.push_str("\"");
@@ -376,6 +381,8 @@ pub fn import_wz_xml(xml: &str) -> WzResult<(String, Vec<(String, WzProperty)>)>
                     width,
                     height,
                     format,
+                    // XML basedata is a full-resolution PNG; no scale needed.
+                    scale: 0,
                     properties: Vec::new(),
                     png_data,
                 })
@@ -569,6 +576,7 @@ pub fn import_wz_xml(xml: &str) -> WzResult<(String, Vec<(String, WzProperty)>)>
                                 width,
                                 height,
                                 format,
+                                scale: 0,
                                 properties: children,
                                 png_data,
                             },
@@ -657,11 +665,12 @@ fn unpack_sound_from_attrs(attrs: &HashMap<String, String>) -> (Vec<u8>, Vec<u8>
 fn canvas_to_standard_png(
     width: i32,
     height: i32,
+    scale: u8,
     format: WzPngFormat,
     png_data: &[u8],
 ) -> WzResult<Vec<u8>> {
     let raw = image::decompress_png_data(png_data, None)?;
-    let rgba = image::decode_pixels(&raw, width as u32, height as u32, format)?;
+    let rgba = image::decode_canvas_pixels(&raw, width as u32, height as u32, scale, format)?;
     rgba_to_png_bytes(&rgba, width as u32, height as u32)
 }
 
@@ -919,6 +928,7 @@ mod tests {
                 width: 2,
                 height: 1,
                 format: WzPngFormat::Bgra8888,
+                scale: 0,
                 properties: vec![("origin".to_string(), WzProperty::Vector { x: 5, y: 10 })],
                 png_data,
             },
@@ -944,6 +954,7 @@ mod tests {
             format,
             properties,
             png_data: got_png,
+            ..
         } = &imported[0].1
         {
             assert_eq!(*width, 2);

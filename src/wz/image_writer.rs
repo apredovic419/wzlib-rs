@@ -155,6 +155,7 @@ fn write_extended_content<W: Write + Seek>(
             width,
             height,
             format,
+            scale,
             properties,
             png_data,
         } => {
@@ -170,8 +171,11 @@ fn write_extended_content<W: Write + Seek>(
 
             writer.write_compressed_int(*width)?;
             writer.write_compressed_int(*height)?;
-            writer.write_compressed_int(format.format_low())?;
-            writer.write_compressed_int(format.format_high())?;
+            // First compressed int = full codec id; second = scale exponent
+            // (`format2`). This mirrors the real WZ layout — never split the
+            // codec id across the two fields (see `WzPngFormat::from_combined`).
+            writer.write_compressed_int(format.format_id() as i32)?;
+            writer.write_compressed_int(*scale as i32)?;
             writer.write_i32(0)?; // padding
             writer.write_i32(png_data.len() as i32 + 1)?;
             writer.write_u8(0)?; // header byte
@@ -403,6 +407,7 @@ mod tests {
             width: 4,
             height: 4,
             format: WzPngFormat::Bgra8888,
+            scale: 0,
             properties: vec![("origin".into(), WzProperty::Vector { x: 0, y: 0 })],
             png_data: vec![0x78, 0x9C, 0x01, 0x00, 0x00], // minimal zlib
         };
@@ -412,12 +417,14 @@ mod tests {
                 width,
                 height,
                 format,
+                scale,
                 properties,
                 png_data,
             } => {
                 assert_eq!(*width, 4);
                 assert_eq!(*height, 4);
                 assert_eq!(format.format_id(), WzPngFormat::Bgra8888.format_id());
+                assert_eq!(*scale, 0);
                 assert_eq!(properties.len(), 1);
                 assert_eq!(png_data, &[0x78, 0x9C, 0x01, 0x00, 0x00]);
             }

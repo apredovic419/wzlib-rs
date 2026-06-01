@@ -331,12 +331,19 @@ fn parse_canvas_property<R: Read + Seek>(
     }
     let png_data = reader.read_bytes((raw_data_len - 1) as usize)?;
 
-    let format = WzPngFormat::from_raw(format_low, format_high);
+    // The first compressed int (`format_low`) is the full pixel-codec id; the
+    // second (`format_high`) is a scale exponent (`format2`), not part of the
+    // codec. Image data is stored at `(w >> scale) × (h >> scale)` and is
+    // upscaled by `decode_canvas_pixels`. Folding the two together (the old
+    // `low + (high << 8)`) silently corrupted scaled canvases.
+    let format = WzPngFormat::from_combined(format_low.max(0) as u32);
+    let scale = format_high.clamp(0, u8::MAX as i32) as u8;
 
     Ok(WzProperty::Canvas {
         width,
         height,
         format,
+        scale,
         properties,
         png_data,
     })

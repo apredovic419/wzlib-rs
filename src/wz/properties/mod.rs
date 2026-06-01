@@ -23,6 +23,12 @@ pub enum WzProperty {
         width: i32,
         height: i32,
         format: WzPngFormat,
+        /// WZ scale exponent (`format2`). The pixel data is stored at
+        /// `(width >> scale) × (height >> scale)` and must be nearest-neighbor
+        /// upscaled to `(width, height)`. Almost always 0. See
+        /// [`crate::image::decode_canvas_pixels`].
+        #[serde(default)]
+        scale: u8,
         properties: Vec<(String, WzProperty)>,
         png_data: Vec<u8>, // raw compressed PNG, not yet decoded to pixels
     },
@@ -195,6 +201,7 @@ mod tests {
             width: 1,
             height: 1,
             format: WzPngFormat::Bgra8888,
+            scale: 0,
             properties: vec![("origin".into(), WzProperty::Vector { x: 0, y: 0 })],
             png_data: vec![],
         };

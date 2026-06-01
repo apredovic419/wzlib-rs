@@ -63,11 +63,19 @@ pub enum WzPngFormat {
 }
 
 impl WzPngFormat {
-    pub fn from_raw(format_low: i32, format_high: i32) -> Self {
-        let combined = (format_low + (format_high << 8)) as u32;
-        Self::from_combined(combined)
-    }
-
+    /// Build a codec from the WZ canvas `format` field (the first compressed
+    /// int in the canvas header). This value *alone* identifies the pixel
+    /// codec — e.g. `1` = BGRA4444, `513` = RGB565, `2050` = DXT5.
+    ///
+    /// The canvas header carries a *second* compressed int (`format2`) that is
+    /// a **scale exponent**, not part of the codec id. The image is stored at
+    /// `(width >> scale) × (height >> scale)` and nearest-neighbor upscaled to
+    /// `(width, height)`. The scale is handled by the caller (parse stores it
+    /// on the Canvas; [`crate::image::decode_canvas_pixels`] applies it) and
+    /// must NOT be folded into the codec id. (Historically this crate combined
+    /// the two fields as `low + (high << 8)`, which silently corrupted the
+    /// codec id whenever `scale != 0` — e.g. RGB565 at scale 4 read back as the
+    /// bogus id 1537.)
     pub fn from_combined(value: u32) -> Self {
         match value {
             1 => WzPngFormat::Bgra4444,
@@ -189,17 +197,19 @@ mod tests {
     }
 
     #[test]
-    fn test_png_format_from_raw() {
-        // Argb1555 = 257 = 1 + (1 << 8)
-        assert_eq!(WzPngFormat::from_raw(1, 1), WzPngFormat::Argb1555);
-        // Rgb565 = 513 = 1 + (2 << 8)
-        assert_eq!(WzPngFormat::from_raw(1, 2), WzPngFormat::Rgb565);
-        // Bgra4444 = 1 = 1 + (0 << 8)
-        assert_eq!(WzPngFormat::from_raw(1, 0), WzPngFormat::Bgra4444);
-        // Dxt3 = 1026 = 2 + (4 << 8)
-        assert_eq!(WzPngFormat::from_raw(2, 4), WzPngFormat::Dxt3);
-        // Dxt5 = 2050 = 2 + (8 << 8)
-        assert_eq!(WzPngFormat::from_raw(2, 8), WzPngFormat::Dxt5);
+    fn test_png_format_codec_id_is_format_low_alone() {
+        // The WZ `format` field alone is the codec id — the second field
+        // (`format2`) is a scale exponent, NOT part of the codec. These are the
+        // real on-disk `format` values observed in v83 WZ.
+        assert_eq!(WzPngFormat::from_combined(1), WzPngFormat::Bgra4444);
+        assert_eq!(WzPngFormat::from_combined(2), WzPngFormat::Bgra8888);
+        assert_eq!(WzPngFormat::from_combined(257), WzPngFormat::Argb1555);
+        assert_eq!(WzPngFormat::from_combined(513), WzPngFormat::Rgb565);
+        assert_eq!(WzPngFormat::from_combined(1026), WzPngFormat::Dxt3);
+        assert_eq!(WzPngFormat::from_combined(2050), WzPngFormat::Dxt5);
+        // The historically-bogus combined value (RGB565 at scale 4 folded as
+        // `513 + (4 << 8)`) must stay Unknown — scale is never folded in.
+        assert_eq!(WzPngFormat::from_combined(1537), WzPngFormat::Unknown(1537));
     }
 
     // ── raw_data_size ──────────────────────────────────────────────

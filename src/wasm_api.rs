@@ -82,9 +82,9 @@ fn prop_to_json(
             width,
             height,
             format,
+            scale,
             properties,
             png_data,
-            ..
         } => {
             let children = children_to_json_inner(properties, blobs.as_deref_mut());
             let mut obj = json!({
@@ -93,6 +93,7 @@ fn prop_to_json(
                 "width": width,
                 "height": height,
                 "format": format.format_id(),
+                "scale": scale,
                 "children": children,
             });
             if let Some(blobs) = blobs {
@@ -227,6 +228,7 @@ fn prop_to_json_b64(name: &str, prop: &WzProperty) -> serde_json::Value {
             width,
             height,
             format,
+            scale,
             properties,
             png_data,
         } => {
@@ -237,6 +239,7 @@ fn prop_to_json_b64(name: &str, prop: &WzProperty) -> serde_json::Value {
             json!({
                 "name": name, "type": "Canvas",
                 "width": width, "height": height, "format": format.format_id(),
+                "scale": scale,
                 "children": children,
                 "base64Data": base64::engine::general_purpose::STANDARD.encode(png_data),
             })
@@ -364,14 +367,16 @@ fn decode_canvas(prop: &WzProperty, iv: &[u8; 4]) -> Result<Vec<u8>, JsError> {
             width,
             height,
             format,
+            scale,
             png_data,
             ..
         } => {
             let wz_key = crypto::aes_encryption::generate_wz_key(iv, 0x10000, None);
             let raw = image::decompress_png_data(png_data, Some(&wz_key))
                 .map_err(|e| JsError::new(&format!("Decompress failed: {}", e)))?;
-            let rgba = image::decode_pixels(&raw, *width as u32, *height as u32, *format)
-                .map_err(|e| JsError::new(&format!("Pixel decode failed: {}", e)))?;
+            let rgba =
+                image::decode_canvas_pixels(&raw, *width as u32, *height as u32, *scale, *format)
+                    .map_err(|e| JsError::new(&format!("Pixel decode failed: {}", e)))?;
             let mut result = Vec::with_capacity(8 + rgba.len());
             result.extend_from_slice(&(*width as u32).to_le_bytes());
             result.extend_from_slice(&(*height as u32).to_le_bytes());
@@ -1210,6 +1215,7 @@ fn json_node_to_property(
             width: node["width"].as_i64().unwrap_or(0) as i32,
             height: node["height"].as_i64().unwrap_or(0) as i32,
             format: WzPngFormat::from_combined(node["format"].as_u64().unwrap_or(2) as u32),
+            scale: node["scale"].as_u64().unwrap_or(0) as u8,
             properties: parse_children(node, blobs)?,
             png_data: get_blob(node, blobs, "Canvas")?.to_vec(),
         },
