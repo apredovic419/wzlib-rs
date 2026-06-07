@@ -21,6 +21,10 @@ fn init_rgba(
 }
 
 /// Generic per-pixel converter: validates, allocates, and runs a closure for each pixel.
+///
+/// Uses `chunks_exact` so the closure receives fixed-size, bounds-check-free
+/// slices — this lets LLVM autovectorize the simple converters (no `unsafe`,
+/// no SIMD intrinsics). See `bgra8888_to_rgba` for a hand-tuned word-op variant.
 fn convert_pixels(
     data: &[u8],
     pixel_count: usize,
@@ -29,8 +33,12 @@ fn convert_pixels(
     f: impl Fn(&[u8], &mut [u8]),
 ) -> WzResult<Vec<u8>> {
     let mut rgba = init_rgba(data, pixel_count, bpp, format)?;
-    for i in 0..pixel_count {
-        f(&data[i * bpp..], &mut rgba[i * 4..]);
+    for (src, dst) in data
+        .chunks_exact(bpp)
+        .zip(rgba.chunks_exact_mut(4))
+        .take(pixel_count)
+    {
+        f(src, dst);
     }
     Ok(rgba)
 }
@@ -48,12 +56,20 @@ pub fn bgra4444_to_rgba(data: &[u8], pixel_count: usize) -> WzResult<Vec<u8>> {
 }
 
 pub fn bgra8888_to_rgba(data: &[u8], pixel_count: usize) -> WzResult<Vec<u8>> {
-    convert_pixels(data, pixel_count, 4, "BGRA8888", |src, dst| {
-        dst[0] = src[2]; // R
-        dst[1] = src[1]; // G
-        dst[2] = src[0]; // B
-        dst[3] = src[3]; // A
-    })
+    // BGRA → RGBA is a per-pixel B↔R swap. Reading each pixel as a little-endian
+    // u32 (B,G,R,A → bits 0,8,16,24) turns the swap into three branch-free word
+    // ops, which LLVM autovectorizes into a tight SIMD loop.
+    let mut rgba = init_rgba(data, pixel_count, 4, "BGRA8888")?;
+    for (src, dst) in data
+        .chunks_exact(4)
+        .zip(rgba.chunks_exact_mut(4))
+        .take(pixel_count)
+    {
+        let v = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+        let out = (v & 0xFF00_FF00) | ((v & 0x0000_00FF) << 16) | ((v >> 16) & 0x0000_00FF);
+        dst.copy_from_slice(&out.to_le_bytes());
+    }
+    Ok(rgba)
 }
 
 pub fn argb1555_to_rgba(data: &[u8], pixel_count: usize) -> WzResult<Vec<u8>> {

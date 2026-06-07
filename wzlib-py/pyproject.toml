@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "wzlib"
-version = "0.1.4"
+version = "0.1.5a1"
 requires-python = ">=3.9"
 description = "MapleStory WZ file parser and editor — Python bindings"
 license = { text = "MIT" }

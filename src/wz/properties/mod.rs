@@ -1,9 +1,86 @@
 //! WZ property types — the value nodes in the WZ object tree.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::wz::mcv::McvHeader;
 use crate::wz::types::WzPngFormat;
+
+/// Compressed Canvas pixel bytes, either owned or referencing a shared source buffer.
+///
+/// `Loaded` is the eager form produced by [`parse_wz_image`](crate::wz::image::parse_wz_image)
+/// and all build/edit/xml paths. `Ref` is produced by
+/// [`parse_wz_image_lazy`](crate::wz::image::parse_wz_image_lazy): it records an
+/// `offset`/`len` into a shared `Arc<[u8]>` (the original image bytes) instead of
+/// copying, so parsing a large IMG does not duplicate every frame's pixel data.
+/// Both forms deref to `&[u8]`, so consumers read them identically.
+#[derive(Debug, Clone)]
+pub enum CanvasData {
+    Loaded(Vec<u8>),
+    Ref { src: Arc<[u8]>, offset: usize, len: usize },
+}
+
+impl CanvasData {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            CanvasData::Loaded(v) => v,
+            // offset/len are recorded from real read positions, so the range is valid
+            // by construction; fall back to empty if a corrupt Ref ever escapes.
+            CanvasData::Ref { src, offset, len } => {
+                src.get(*offset..*offset + *len).unwrap_or(&[])
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            CanvasData::Loaded(v) => v.len(),
+            CanvasData::Ref { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+}
+
+impl std::ops::Deref for CanvasData {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl AsRef<[u8]> for CanvasData {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl Default for CanvasData {
+    fn default() -> Self {
+        CanvasData::Loaded(Vec::new())
+    }
+}
+
+// Serializes identically to the old `Vec<u8>` field (a byte sequence); always
+// deserializes back into the owned `Loaded` form.
+impl Serialize for CanvasData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_bytes().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CanvasData {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(CanvasData::Loaded(Vec::<u8>::deserialize(deserializer)?))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WzProperty {
@@ -30,7 +107,7 @@ pub enum WzProperty {
         #[serde(default)]
         scale: u8,
         properties: Vec<(String, WzProperty)>,
-        png_data: Vec<u8>, // raw compressed PNG, not yet decoded to pixels
+        png_data: CanvasData, // compressed pixel bytes (owned or shared-ref), not yet decoded
     },
 
     Vector {
@@ -203,7 +280,7 @@ mod tests {
             format: WzPngFormat::Bgra8888,
             scale: 0,
             properties: vec![("origin".into(), WzProperty::Vector { x: 0, y: 0 })],
-            png_data: vec![],
+            png_data: CanvasData::Loaded(vec![]),
         };
         assert_eq!(prop.children().unwrap().len(), 1);
     }

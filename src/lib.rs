@@ -17,6 +17,7 @@ pub use wz::file::{
 };
 pub use wz::header::WzHeader;
 pub use wz::image::parse_image as parse_wz_image;
+pub use wz::image::parse_image_lazy as parse_wz_image_lazy;
 pub use wz::keys::WzKey;
 pub use wz::list_file::{
     parse_list_file, parse_list_file_with_iv, parse_list_file_with_iv_and_user_key,
@@ -25,7 +26,7 @@ pub use wz::ms_file::{
     build_ms_file, decrypt_entry_data, encrypt_entry_data, parse_ms_file, MsEntry, MsParsedFile,
     MsSaveEntry, MsVersion,
 };
-pub use wz::properties::WzProperty;
+pub use wz::properties::{CanvasData, WzProperty};
 pub use wz::types::WzMapleVersion;
 pub use wz::types::WzPngFormat;
 pub use wz::xml::{export_wz_xml, import_wz_xml, XmlMode};

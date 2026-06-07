@@ -1,6 +1,6 @@
 [package]
 name = "wzlib-rs"
-version = "0.1.4"
+version = "0.1.5-alpha.1"
 edition = "2021"
 description = "MapleStory WZ file parser — Rust core with optional WASM bindings"
 license = "MIT"
@@ -38,6 +38,19 @@ optional = true
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "parse_image"
+harness = false
+
+[[bench]]
+name = "canvas_decode"
+harness = false
+
+[[bench]]
+name = "string_decrypt"
+harness = false
 
 [profile.release]
 opt-level = "s"

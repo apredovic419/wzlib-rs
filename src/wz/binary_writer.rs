@@ -38,6 +38,10 @@ impl<W: Write + Seek> WzBinaryWriter<W> {
         }
     }
 
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+
     pub fn position(&mut self) -> WzResult<u64> {
         Ok(self.writer.stream_position()?)
     }

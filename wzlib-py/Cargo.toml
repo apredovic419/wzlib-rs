@@ -1,6 +1,6 @@
 [package]
 name = "wzlib-py"
-version = "0.1.4"
+version = "0.1.5-alpha.1"
 edition = "2021"
 description = "Python bindings for wzlib-rs — MapleStory WZ file parser and editor"
 

@@ -11,7 +11,7 @@ use std::io::{Read, Seek};
 use super::binary_reader::WzBinaryReader;
 use super::error::{WzError, WzResult};
 use super::keys::WzKey;
-use super::properties::WzProperty;
+use super::properties::{CanvasData, WzProperty};
 use super::types::WzPngFormat;
 use crate::crypto::{WZ_BMSCLASSIC_IV, WZ_GMSIV, WZ_MSEAIV};
 
@@ -81,6 +81,23 @@ pub fn parse_image<R: Read + Seek>(
         }
         other => Err(WzError::InvalidImageHeader(other)),
     }
+}
+
+/// Like [`parse_image`], but Canvas `png_data` is stored as a zero-copy
+/// [`CanvasData::Ref`] into `src` rather than copied. `src` must be the exact
+/// byte buffer `reader` reads from (index 0 = reader position 0) and must outlive
+/// the returned property tree (the `Arc` co-owns it, so this is automatic).
+///
+/// Use this when parsing large IMGs where most Canvas frames are never decoded:
+/// it avoids duplicating every frame's compressed pixels into the tree.
+pub fn parse_image_lazy<R: Read + Seek>(
+    reader: &mut WzBinaryReader<R>,
+    src: std::sync::Arc<[u8]>,
+) -> WzResult<Vec<(String, WzProperty)>> {
+    reader.lazy_canvas_src = Some(src);
+    let result = parse_image(reader);
+    reader.lazy_canvas_src = None;
+    result
 }
 
 pub fn parse_property_list<R: Read + Seek>(
@@ -329,7 +346,25 @@ fn parse_canvas_property<R: Read + Seek>(
             raw_data_len
         )));
     }
-    let png_data = reader.read_bytes((raw_data_len - 1) as usize)?;
+    let data_len = (raw_data_len - 1) as usize;
+    // Lazy mode: record an offset/len into the shared source buffer and skip the
+    // bytes, instead of copying them into the property tree.
+    let png_data = match reader.lazy_canvas_src.clone() {
+        Some(src) => {
+            let offset = reader.position()? as usize;
+            if offset + data_len > src.len() {
+                return Err(WzError::Custom(format!(
+                    "Canvas data range {}..{} exceeds source buffer ({} bytes)",
+                    offset,
+                    offset + data_len,
+                    src.len()
+                )));
+            }
+            reader.seek((offset + data_len) as u64)?;
+            CanvasData::Ref { src, offset, len: data_len }
+        }
+        None => CanvasData::Loaded(reader.read_bytes(data_len)?),
+    };
 
     // The first compressed int (`format_low`) is the full pixel-codec id; the
     // second (`format_high`) is a scale exponent (`format2`), not part of the
@@ -711,7 +746,7 @@ mod tests {
             assert_eq!(*height, 8);
             assert_eq!(*format, WzPngFormat::Bgra8888);
             assert!(properties.is_empty());
-            assert_eq!(png_data, &png_payload);
+            assert_eq!(png_data.as_bytes(), &png_payload[..]);
         } else {
             panic!("Expected Canvas, got {:?}", props[0].1);
         }
@@ -762,6 +797,61 @@ mod tests {
             assert_eq!(properties[0].1.as_int(), Some(100));
         } else {
             panic!("Expected Canvas");
+        }
+    }
+
+    #[test]
+    fn test_parse_canvas_lazy_zero_copy() {
+        use std::sync::Arc;
+
+        let png_payload = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let raw_data_len: i32 = png_payload.len() as i32 + 1;
+
+        let mut inner = Vec::new();
+        inner.push(0x00); // _skip
+        inner.push(0x00); // has_children = 0
+        inner.push(4); // width
+        inner.push(8); // height
+        inner.push(2); // format_low → Bgra8888
+        inner.push(0); // format_high
+        inner.extend_from_slice(&0i32.to_le_bytes()); // _zero
+        inner.extend_from_slice(&raw_data_len.to_le_bytes());
+        inner.push(0x00); // header byte
+        inner.extend_from_slice(&png_payload);
+
+        let value = build_extended_property("Canvas", &inner);
+        let data = build_image_with_property("img", &value);
+
+        // Eager parse (baseline) and lazy parse must agree on the decoded bytes.
+        let eager = parse_image(&mut make_reader(data.clone())).unwrap();
+        let src: Arc<[u8]> = Arc::from(data.clone());
+        let mut reader = make_reader(data);
+        let lazy = parse_image_lazy(&mut reader, src.clone()).unwrap();
+
+        let eager_png = match &eager[0].1 {
+            WzProperty::Canvas { png_data, .. } => png_data,
+            _ => panic!("Expected Canvas"),
+        };
+        match &lazy[0].1 {
+            WzProperty::Canvas {
+                png_data, width, height, ..
+            } => {
+                assert_eq!(*width, 4);
+                assert_eq!(*height, 8);
+                // Lazy must be a zero-copy Ref, not an owned copy.
+                assert!(
+                    matches!(png_data, CanvasData::Ref { .. }),
+                    "lazy parse should produce CanvasData::Ref"
+                );
+                // The Ref must point at the same bytes within the shared buffer.
+                assert_eq!(png_data.as_bytes(), &png_payload[..]);
+                assert_eq!(png_data.as_bytes(), eager_png.as_bytes());
+                if let CanvasData::Ref { src: ref_src, offset, len } = png_data {
+                    assert!(Arc::ptr_eq(ref_src, &src), "Ref should share the source Arc");
+                    assert_eq!(&src[*offset..*offset + *len], &png_payload[..]);
+                }
+            }
+            _ => panic!("Expected Canvas"),
         }
     }
 

@@ -1,0 +1,17 @@
+# The `aes` crate (used for WZ key generation) falls back to a *software* AES
+# backend on aarch64 unless ARMv8 AES intrinsics are explicitly enabled via the
+# `aes_armv8` cfg. Enabling it makes WZ key generation ~26× faster
+# (measured: cold key-gen 98µs → 3.7µs on Apple Silicon — see benches/string_decrypt.rs).
+#
+# x86_64 auto-detects AES-NI at runtime, so no flag is needed there.
+# WASM (wasm32-*) has no AES intrinsics and is unaffected by these target sections.
+#
+# NOTE for downstream consumers: this config only affects builds
+# *inside this repo*. To get the speedup in a dependent workspace, add the same
+# rustflags to that workspace's own .cargo/config.toml.
+
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["--cfg", "aes_armv8"]

@@ -11,7 +11,7 @@ use base64::Engine as _;
 use crate::image;
 use crate::image::encode as image_encode;
 use crate::wz::error::{WzError, WzResult};
-use crate::wz::properties::WzProperty;
+use crate::wz::properties::{CanvasData, WzProperty};
 use crate::wz::types::WzPngFormat;
 
 // ── Public types ─────────────────────────────────────────────────────
@@ -384,7 +384,7 @@ pub fn import_wz_xml(xml: &str) -> WzResult<(String, Vec<(String, WzProperty)>)>
                     // XML basedata is a full-resolution PNG; no scale needed.
                     scale: 0,
                     properties: Vec::new(),
-                    png_data,
+                    png_data: CanvasData::Loaded(png_data),
                 })
             }
             "convex" => Some(WzProperty::Convex { points: Vec::new() }),
@@ -578,7 +578,7 @@ pub fn import_wz_xml(xml: &str) -> WzResult<(String, Vec<(String, WzProperty)>)>
                                 format,
                                 scale: 0,
                                 properties: children,
-                                png_data,
+                                png_data: CanvasData::Loaded(png_data),
                             },
                         ),
                         Frame::Convex { name } => (name, WzProperty::Convex { points: children }),
@@ -930,7 +930,7 @@ mod tests {
                 format: WzPngFormat::Bgra8888,
                 scale: 0,
                 properties: vec![("origin".to_string(), WzProperty::Vector { x: 5, y: 10 })],
-                png_data,
+                png_data: CanvasData::Loaded(png_data),
             },
         )];
         let xml = export_wz_xml("test.img", &props, &XmlMode::WithBinaryData);

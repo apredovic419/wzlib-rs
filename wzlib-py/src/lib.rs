@@ -15,7 +15,7 @@ use wzlib_rs::wz::list_file::parse_list_file;
 use wzlib_rs::wz::properties::WzProperty;
 use wzlib_rs::wz::types::{WzDirectoryType, WzMapleVersion, WzPngFormat};
 use wzlib_rs::{
-    WzBinaryReader, WzFile, WzHeader,
+    CanvasData, WzBinaryReader, WzFile, WzHeader,
     compress_png_data, decode_pixels, decompress_png_data, encode_pixels,
     parse_hotfix_data_wz, parse_wz_image, save_hotfix_data_wz,
 };
@@ -939,7 +939,7 @@ impl WzNode {
             let prop = get_prop(&root, &parts)
                 .ok_or_else(|| PyKeyError::new_err(self.path.join("/")))?;
             match prop {
-                WzProperty::Canvas { width, height, format, png_data, properties } => {
+                WzProperty::Canvas { width, height, format, png_data, properties, .. } => {
                     let outlink = properties.iter()
                         .find(|(n, _)| n == "_outlink")
                         .and_then(|(_, p)| if let WzProperty::String(s) = p { Some(s.clone()) } else { None });
@@ -985,7 +985,7 @@ impl WzNode {
                 *w = width as i32;
                 *h = height as i32;
                 *format = WzPngFormat::Bgra8888;
-                *png_data = compressed;
+                *png_data = CanvasData::Loaded(compressed);
                 Ok(())
             }
             other => Err(PyValueError::new_err(format!(

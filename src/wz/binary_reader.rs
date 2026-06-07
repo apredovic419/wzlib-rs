@@ -15,6 +15,11 @@ pub struct WzBinaryReader<R: Read + Seek> {
     pub hash: u32,
     pub header: WzHeader,
     pub start_offset: u64,
+    /// When set, Canvas parsing records `offset`/`len` into this shared buffer
+    /// instead of copying the compressed pixel bytes. Set by
+    /// [`parse_image_lazy`](crate::wz::image::parse_image_lazy); the buffer must
+    /// be the same bytes this reader reads from, with index 0 = reader position 0.
+    pub(crate) lazy_canvas_src: Option<std::sync::Arc<[u8]>>,
 }
 
 macro_rules! impl_read_le {
@@ -35,6 +40,7 @@ impl<R: Read + Seek> WzBinaryReader<R> {
             hash: 0,
             header,
             start_offset,
+            lazy_canvas_src: None,
         }
     }
 

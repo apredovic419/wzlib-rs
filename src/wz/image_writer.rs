@@ -409,7 +409,7 @@ mod tests {
             format: WzPngFormat::Bgra8888,
             scale: 0,
             properties: vec![("origin".into(), WzProperty::Vector { x: 0, y: 0 })],
-            png_data: vec![0x78, 0x9C, 0x01, 0x00, 0x00], // minimal zlib
+            png_data: crate::wz::properties::CanvasData::Loaded(vec![0x78, 0x9C, 0x01, 0x00, 0x00]), // minimal zlib
         };
         let props = write_then_read(vec![("c".into(), canvas)]);
         match &props[0].1 {
@@ -426,7 +426,7 @@ mod tests {
                 assert_eq!(format.format_id(), WzPngFormat::Bgra8888.format_id());
                 assert_eq!(*scale, 0);
                 assert_eq!(properties.len(), 1);
-                assert_eq!(png_data, &[0x78, 0x9C, 0x01, 0x00, 0x00]);
+                assert_eq!(png_data.as_bytes(), &[0x78, 0x9C, 0x01, 0x00, 0x00]);
             }
             other => panic!("Expected Canvas, got {:?}", other),
         }
