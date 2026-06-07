@@ -100,6 +100,175 @@ pub fn parse_image_lazy<R: Read + Seek>(
     result
 }
 
+/// Parse only the single property at `path` within an IMG, **skipping sibling
+/// subtrees** instead of materializing the whole tree.
+///
+/// Each non-matching extended (`0x09`) sibling is skipped by reading its
+/// block-size prefix and seeking past it, so reaching a deep node in a large
+/// IMG parses only the nodes along `path` (plus a few seeks), not the entire
+/// tree. Canvas `png_data` on the matched node is stored lazily as
+/// [`CanvasData::Ref`] into `src`, same contract as [`parse_image_lazy`].
+///
+/// Returns `Ok(None)` when `path` is absent (a sibling name never matched, or a
+/// non-final component was a scalar/non-`Property` and so can't be descended).
+/// `path` must be non-empty. Useful for extracting one property from a large
+/// IMG that contains many entries (e.g. one item's `info` out of a packed
+/// bucket file); for reading a whole tree use [`parse_image`] /
+/// [`parse_image_lazy`].
+pub fn parse_image_path_lazy<R: Read + Seek>(
+    reader: &mut WzBinaryReader<R>,
+    src: std::sync::Arc<[u8]>,
+    path: &[&str],
+) -> WzResult<Option<WzProperty>> {
+    reader.lazy_canvas_src = Some(src);
+    let result = parse_image_path(reader, path);
+    reader.lazy_canvas_src = None;
+    result
+}
+
+fn parse_image_path<R: Read + Seek>(
+    reader: &mut WzBinaryReader<R>,
+    path: &[&str],
+) -> WzResult<Option<WzProperty>> {
+    if path.is_empty() {
+        return Err(WzError::Custom("parse_image_path: empty path".into()));
+    }
+    let offset = reader.position()?;
+    let header_byte = reader.read_u8()?;
+    match header_byte {
+        0x73 => {
+            let pos_after_header = reader.position()?;
+            let prop_str = reader.read_wz_string()?;
+            let val = reader.read_u16()?;
+            if prop_str == "Property" && val == 0 {
+                return parse_property_list_path(reader, offset, path);
+            }
+            // Image encrypted with a different IV than the directory — retry
+            // the known IVs (mirrors `parse_image`'s `try_iv_fallback`), then
+            // traverse the path with the matching key.
+            for &iv in &KNOWN_IVS {
+                reader.wz_key = WzKey::new(iv);
+                reader.seek(pos_after_header)?;
+                if let Ok(s) = reader.read_wz_string() {
+                    if s == "Property" && reader.read_u16()? == 0 {
+                        return parse_property_list_path(reader, offset, path);
+                    }
+                }
+            }
+            Err(WzError::InvalidImageHeader(0x73))
+        }
+        0x1B => {
+            let str_offset = reader.read_i32()?;
+            let string_pos = offset.wrapping_add(str_offset as i64 as u64);
+            let prop_str = reader.read_string_at_offset(string_pos)?;
+            let val = reader.read_u16()?;
+            if prop_str == "Property" && val == 0 {
+                return parse_property_list_path(reader, offset, path);
+            }
+            Err(WzError::InvalidImageHeader(0x1B))
+        }
+        // 0x01 (Lua) has no addressable property path.
+        other => Err(WzError::InvalidImageHeader(other)),
+    }
+}
+
+/// Walk one property list looking for `path[0]`. On a match: if it is the
+/// final component, parse and return its value; otherwise descend into it
+/// (must be a `Property` container) and recurse on `path[1..]`. Non-matching
+/// children are skipped by [`skip_property_value`]. Stops as soon as the
+/// matched child is handled — later siblings are never read.
+fn parse_property_list_path<R: Read + Seek>(
+    reader: &mut WzBinaryReader<R>,
+    offset: u64,
+    path: &[&str],
+) -> WzResult<Option<WzProperty>> {
+    let count = reader.read_compressed_int()?;
+    if !(0..=super::MAX_PROPERTY_COUNT).contains(&count) {
+        return Err(WzError::Custom(format!("Invalid property count: {}", count)));
+    }
+    let want = path[0];
+    for _ in 0..count {
+        let name = reader.read_string_block(offset)?;
+        if name == want {
+            if path.len() == 1 {
+                return parse_property_value(reader, offset);
+            }
+            return descend_into_property(reader, offset, &path[1..]);
+        }
+        skip_property_value(reader, offset)?;
+    }
+    Ok(None)
+}
+
+/// Descend into the just-matched child (whose value bytes start at the reader)
+/// when more path remains. The child must be a `0x09` extended `Property`
+/// container; anything else means the path can't continue → `Ok(None)`.
+fn descend_into_property<R: Read + Seek>(
+    reader: &mut WzBinaryReader<R>,
+    offset: u64,
+    rest: &[&str],
+) -> WzResult<Option<WzProperty>> {
+    if reader.read_u8()? != 0x09 {
+        return Ok(None); // a scalar/string — cannot descend by name
+    }
+    let _block_size = reader.read_u32()?; // we read within the block, not past it
+    let type_byte = reader.read_u8()?;
+    let type_str = match type_byte {
+        0x01 | 0x1B => {
+            let str_offset = reader.read_i32()?;
+            reader.read_string_at_offset(offset.wrapping_add(str_offset as i64 as u64))?
+        }
+        0x00 | 0x73 => reader.read_wz_string()?,
+        _ => return Ok(None),
+    };
+    if type_str.as_str() != super::WZ_TYPE_PROPERTY {
+        return Ok(None); // e.g. Canvas/Convex — no named children to descend
+    }
+    let _padding = reader.read_u16()?;
+    parse_property_list_path(reader, offset, rest)
+}
+
+/// Advance the reader past one property value without building it. Mirrors the
+/// cursor movement of [`parse_property_value`]; the win is the `0x09` arm,
+/// which seeks past the whole extended block (a sibling subtree — another
+/// item, an animation frame) using its block-size prefix instead of recursing.
+fn skip_property_value<R: Read + Seek>(
+    reader: &mut WzBinaryReader<R>,
+    offset: u64,
+) -> WzResult<()> {
+    let prop_type = reader.read_u8()?;
+    match prop_type {
+        0x00 => {}
+        0x02 | 0x0B => {
+            reader.read_i16()?;
+        }
+        0x03 | 0x13 => {
+            reader.read_compressed_int()?;
+        }
+        0x14 => {
+            reader.read_compressed_long()?;
+        }
+        0x04 => {
+            if reader.read_u8()? == 0x80 {
+                reader.read_f32()?;
+            }
+        }
+        0x05 => {
+            reader.read_f64()?;
+        }
+        0x08 => {
+            reader.read_string_block(offset)?;
+        }
+        0x09 => {
+            let block_size = reader.read_u32()?;
+            let end_of_block = reader.position()? + block_size as u64;
+            reader.seek(end_of_block)?;
+        }
+        other => return Err(WzError::UnknownPropertyType(format!("0x{:02X}", other))),
+    }
+    Ok(())
+}
+
 pub fn parse_property_list<R: Read + Seek>(
     reader: &mut WzBinaryReader<R>,
     offset: u64,
@@ -705,6 +874,109 @@ mod tests {
         assert_eq!(props[1].1.as_int(), Some(7));
         assert_eq!(props[2].0, "c");
         assert_eq!(props[2].1.as_int(), Some(42));
+    }
+
+    // ── Path (partial) parse — parse_image_path_lazy ───────────────
+
+    /// A small compressed-int property value (`|v| < 128`).
+    fn int_value(v: i32) -> Vec<u8> {
+        vec![0x03u8, v as i8 as u8]
+    }
+
+    /// A `Property` SubProperty value from a child name→value list.
+    fn subproperty(children: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut content = vec![0u8, 0u8]; // u16 padding read by WZ_TYPE_PROPERTY
+        content.push(children.len() as u8); // count (compressed int, small)
+        for (name, value) in children {
+            content.extend_from_slice(&string_block(name));
+            content.extend_from_slice(value);
+        }
+        build_extended_property("Property", &content)
+    }
+
+    /// Root tree:  first=Int(1), target={ junk={x:100}, info={icon:7, price:99} }, last=Int(2).
+    /// `target` is reached by skipping the scalar `first`; `info` is reached by
+    /// skipping the 0x09 SubProperty `junk` via its block-size — exercising the
+    /// sibling-skip seek path.
+    fn nested_path_image() -> Vec<u8> {
+        let mut data = property_image_header();
+        data.push(3); // count
+        data.extend_from_slice(&string_block("first"));
+        data.extend_from_slice(&int_value(1));
+        data.extend_from_slice(&string_block("target"));
+        data.extend_from_slice(&subproperty(&[
+            ("junk", subproperty(&[("x", int_value(100))])),
+            ("info", subproperty(&[("icon", int_value(7)), ("price", int_value(99))])),
+        ]));
+        data.extend_from_slice(&string_block("last"));
+        data.extend_from_slice(&int_value(2));
+        data
+    }
+
+    #[test]
+    fn parse_image_path_reaches_nested_leaf_skipping_siblings() {
+        let data = nested_path_image();
+        let src: std::sync::Arc<[u8]> = std::sync::Arc::from(data.clone().into_boxed_slice());
+
+        let mut reader = make_reader(data.clone());
+        let node = parse_image_path_lazy(&mut reader, src.clone(), &["target", "info", "icon"])
+            .unwrap();
+        assert!(
+            matches!(node, Some(WzProperty::Int(7))),
+            "must reach the leaf past the scalar `first` + the 0x09 `junk` sibling, got {node:?}"
+        );
+
+        // A non-final match returns the whole matched SubProperty.
+        let mut reader = make_reader(data.clone());
+        let info = parse_image_path_lazy(&mut reader, src.clone(), &["target", "info"])
+            .unwrap()
+            .expect("info present");
+        match info {
+            WzProperty::SubProperty { properties } => {
+                assert_eq!(properties.len(), 2, "info has icon + price");
+                assert_eq!(properties[0].0, "icon");
+            }
+            other => panic!("expected SubProperty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_image_path_returns_none_for_absent_paths() {
+        let data = nested_path_image();
+        let src: std::sync::Arc<[u8]> = std::sync::Arc::from(data.clone().into_boxed_slice());
+        for path in [
+            &["target", "info", "missing"][..],
+            &["target", "nope"][..],
+            &["nope"][..],
+            &["first", "x"][..], // can't descend into a scalar
+        ] {
+            let mut reader = make_reader(data.clone());
+            assert!(
+                parse_image_path_lazy(&mut reader, src.clone(), path)
+                    .unwrap()
+                    .is_none(),
+                "absent path {path:?} must be None"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_image_path_matches_full_parse_at_that_path() {
+        // The partial result must equal what a full parse holds at the path.
+        let data = nested_path_image();
+        let src: std::sync::Arc<[u8]> = std::sync::Arc::from(data.clone().into_boxed_slice());
+
+        let mut reader = make_reader(data.clone());
+        let full = parse_image(&mut reader).unwrap();
+        let target = &full.iter().find(|(n, _)| n == "target").unwrap().1;
+        let info = target.children().unwrap().iter().find(|(n, _)| n == "info").unwrap();
+        let icon_full = info.1.children().unwrap().iter().find(|(n, _)| n == "icon").unwrap();
+        assert_eq!(icon_full.1.as_int(), Some(7));
+
+        let mut reader = make_reader(data.clone());
+        let icon_partial =
+            parse_image_path_lazy(&mut reader, src, &["target", "info", "icon"]).unwrap();
+        assert_eq!(icon_partial.and_then(|p| p.as_int()), icon_full.1.as_int());
     }
 
     // ── Canvas property ───────────────────────────────────────────
