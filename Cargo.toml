@@ -1,6 +1,6 @@
 [package]
 name = "wzlib-rs"
-version = "0.1.5-alpha.2"
+version = "0.1.5-alpha.3"
 edition = "2021"
 description = "MapleStory WZ file parser — Rust core with optional WASM bindings"
 license = "MIT"
@@ -28,7 +28,7 @@ cipher = "0.4"
 thiserror = "2"
 texture2ddecoder = "0.1"
 base64 = "0.22"
-quick-xml = "0.37"
+quick-xml = "0.41"
 png = "0.17"
 
 [dependencies.web-sys]
