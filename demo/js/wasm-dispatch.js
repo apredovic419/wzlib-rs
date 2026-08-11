@@ -12,18 +12,12 @@ export function dispatchDecodeCanvas(imgOffsetOrEntryIndex, propPath) {
   if (state.fileMode === 'ms') {
     return decodeMsCanvas(state.wzData, state.msFileName, imgOffsetOrEntryIndex, propPath);
   }
-  if (state.fileMode === 'hotfix') {
-    return decodeWzCanvas(state.wzData, state.wzVersionName, imgOffsetOrEntryIndex, state.wzVersionHash, propPath, true);
-  }
   return decodeWzCanvas(state.wzData, state.wzVersionName, imgOffsetOrEntryIndex, state.wzVersionHash, propPath);
 }
 
 export function dispatchExtractSound(imgOffsetOrEntryIndex, propPath) {
   if (state.fileMode === 'ms') {
     return extractMsSound(state.wzData, state.msFileName, imgOffsetOrEntryIndex, propPath);
-  }
-  if (state.fileMode === 'hotfix') {
-    return extractWzSound(state.wzData, state.wzVersionName, imgOffsetOrEntryIndex, state.wzVersionHash, propPath, true);
   }
   return extractWzSound(state.wzData, state.wzVersionName, imgOffsetOrEntryIndex, state.wzVersionHash, propPath);
 }

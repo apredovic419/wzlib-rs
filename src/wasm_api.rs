@@ -1217,7 +1217,9 @@ fn json_node_to_property(
             format: WzPngFormat::from_combined(node["format"].as_u64().unwrap_or(2) as u32),
             scale: node["scale"].as_u64().unwrap_or(0) as u8,
             properties: parse_children(node, blobs)?,
-            png_data: crate::wz::properties::CanvasData::Loaded(get_blob(node, blobs, "Canvas")?.to_vec()),
+            png_data: crate::wz::properties::CanvasData::Loaded(
+                get_blob(node, blobs, "Canvas")?.to_vec(),
+            ),
         },
         "Convex" => {
             let points = node["children"]

@@ -184,7 +184,10 @@ fn parse_property_list_path<R: Read + Seek>(
 ) -> WzResult<Option<WzProperty>> {
     let count = reader.read_compressed_int()?;
     if !(0..=super::MAX_PROPERTY_COUNT).contains(&count) {
-        return Err(WzError::Custom(format!("Invalid property count: {}", count)));
+        return Err(WzError::Custom(format!(
+            "Invalid property count: {}",
+            count
+        )));
     }
     let want = path[0];
     for _ in 0..count {
@@ -530,7 +533,11 @@ fn parse_canvas_property<R: Read + Seek>(
                 )));
             }
             reader.seek((offset + data_len) as u64)?;
-            CanvasData::Ref { src, offset, len: data_len }
+            CanvasData::Ref {
+                src,
+                offset,
+                len: data_len,
+            }
         }
         None => CanvasData::Loaded(reader.read_bytes(data_len)?),
     };
@@ -906,7 +913,10 @@ mod tests {
         data.extend_from_slice(&string_block("target"));
         data.extend_from_slice(&subproperty(&[
             ("junk", subproperty(&[("x", int_value(100))])),
-            ("info", subproperty(&[("icon", int_value(7)), ("price", int_value(99))])),
+            (
+                "info",
+                subproperty(&[("icon", int_value(7)), ("price", int_value(99))]),
+            ),
         ]));
         data.extend_from_slice(&string_block("last"));
         data.extend_from_slice(&int_value(2));
@@ -919,8 +929,8 @@ mod tests {
         let src: std::sync::Arc<[u8]> = std::sync::Arc::from(data.clone().into_boxed_slice());
 
         let mut reader = make_reader(data.clone());
-        let node = parse_image_path_lazy(&mut reader, src.clone(), &["target", "info", "icon"])
-            .unwrap();
+        let node =
+            parse_image_path_lazy(&mut reader, src.clone(), &["target", "info", "icon"]).unwrap();
         assert!(
             matches!(node, Some(WzProperty::Int(7))),
             "must reach the leaf past the scalar `first` + the 0x09 `junk` sibling, got {node:?}"
@@ -969,8 +979,19 @@ mod tests {
         let mut reader = make_reader(data.clone());
         let full = parse_image(&mut reader).unwrap();
         let target = &full.iter().find(|(n, _)| n == "target").unwrap().1;
-        let info = target.children().unwrap().iter().find(|(n, _)| n == "info").unwrap();
-        let icon_full = info.1.children().unwrap().iter().find(|(n, _)| n == "icon").unwrap();
+        let info = target
+            .children()
+            .unwrap()
+            .iter()
+            .find(|(n, _)| n == "info")
+            .unwrap();
+        let icon_full = info
+            .1
+            .children()
+            .unwrap()
+            .iter()
+            .find(|(n, _)| n == "icon")
+            .unwrap();
         assert_eq!(icon_full.1.as_int(), Some(7));
 
         let mut reader = make_reader(data.clone());
@@ -1106,7 +1127,10 @@ mod tests {
         };
         match &lazy[0].1 {
             WzProperty::Canvas {
-                png_data, width, height, ..
+                png_data,
+                width,
+                height,
+                ..
             } => {
                 assert_eq!(*width, 4);
                 assert_eq!(*height, 8);
@@ -1118,8 +1142,16 @@ mod tests {
                 // The Ref must point at the same bytes within the shared buffer.
                 assert_eq!(png_data.as_bytes(), &png_payload[..]);
                 assert_eq!(png_data.as_bytes(), eager_png.as_bytes());
-                if let CanvasData::Ref { src: ref_src, offset, len } = png_data {
-                    assert!(Arc::ptr_eq(ref_src, &src), "Ref should share the source Arc");
+                if let CanvasData::Ref {
+                    src: ref_src,
+                    offset,
+                    len,
+                } = png_data
+                {
+                    assert!(
+                        Arc::ptr_eq(ref_src, &src),
+                        "Ref should share the source Arc"
+                    );
                     assert_eq!(&src[*offset..*offset + *len], &png_payload[..]);
                 }
             }

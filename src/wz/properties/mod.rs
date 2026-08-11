@@ -18,7 +18,11 @@ use crate::wz::types::WzPngFormat;
 #[derive(Debug, Clone)]
 pub enum CanvasData {
     Loaded(Vec<u8>),
-    Ref { src: Arc<[u8]>, offset: usize, len: usize },
+    Ref {
+        src: Arc<[u8]>,
+        offset: usize,
+        len: usize,
+    },
 }
 
 impl CanvasData {
@@ -27,9 +31,7 @@ impl CanvasData {
             CanvasData::Loaded(v) => v,
             // offset/len are recorded from real read positions, so the range is valid
             // by construction; fall back to empty if a corrupt Ref ever escapes.
-            CanvasData::Ref { src, offset, len } => {
-                src.get(*offset..*offset + *len).unwrap_or(&[])
-            }
+            CanvasData::Ref { src, offset, len } => src.get(*offset..*offset + *len).unwrap_or(&[]),
         }
     }
 
