@@ -109,9 +109,71 @@ fn nearest_upscale(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     out
 }
 
+/// Inflate `input`, tolerating a stream that never reaches its terminator.
+///
+/// WZ canvas blobs are stored as a raw inflate window whose last deflate block
+/// is not marked BFINAL and which carries no adler32 trailer — the archive
+/// records the byte length instead, so the writer never had to close the
+/// stream. Reference C zlib therefore reports `Z_BUF_ERROR` / "incomplete or
+/// truncated stream" on them even though every pixel byte is present
+/// (a 26×16 BGRA4444 face inflates to exactly 832 = w·h·2 bytes and then stops).
+///
+/// `miniz_oxide` 0.8.x silently accepted that and returned the bytes; 0.9
+/// aligned with C zlib and surfaces the error, so the previous
+/// `Read::read_to_end` here threw away fully-decoded pixel data for *every*
+/// canvas. Driving the inflater directly lets us tell "ran out of input after
+/// producing N bytes" (fine — return them) apart from a real data error or a
+/// stream that produced nothing (still an error).
+fn inflate_lenient(input: &[u8], zlib_header: bool) -> WzResult<Vec<u8>> {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    const MIN_CHUNK: usize = 4 * 1024;
+    // Guess ~4× the compressed size, then grow geometrically. The cap keeps a
+    // pathologically large blob from reserving hundreds of MB up front.
+    const MAX_PREALLOC: usize = 16 * 1024 * 1024;
+
+    let mut inflater = Decompress::new(zlib_header);
+    let mut output: Vec<u8> =
+        Vec::with_capacity(input.len().saturating_mul(4).clamp(MIN_CHUNK, MAX_PREALLOC));
+    let mut stream_end = false;
+
+    loop {
+        if output.len() == output.capacity() {
+            output.reserve(output.capacity().max(MIN_CHUNK));
+        }
+
+        let consumed = (inflater.total_in() as usize).min(input.len());
+        let before_in = inflater.total_in();
+        let before_out = inflater.total_out();
+
+        match inflater.decompress_vec(&input[consumed..], &mut output, FlushDecompress::None) {
+            Ok(Status::StreamEnd) => {
+                stream_end = true;
+                break;
+            }
+            // No progress possible: the inflater wants more input that does not
+            // exist (the unterminated-stream case) — stop and keep what we got.
+            Ok(Status::BufError) => break,
+            Ok(Status::Ok) => {
+                if inflater.total_in() == before_in && inflater.total_out() == before_out {
+                    break; // defensive: never spin on a no-op round
+                }
+            }
+            Err(e) => return Err(WzError::DecompressionFailed(e.to_string())),
+        }
+    }
+
+    if !stream_end && output.is_empty() {
+        return Err(WzError::DecompressionFailed(
+            "incomplete deflate stream (no data decoded)".into(),
+        ));
+    }
+
+    Ok(output)
+}
+
 pub fn decompress_png_data(compressed: &[u8], wz_key: Option<&[u8]>) -> WzResult<Vec<u8>> {
-    use flate2::read::{DeflateDecoder, ZlibDecoder};
-    use std::io::{Cursor, Read};
+    use std::io::Cursor;
 
     if compressed.len() < 2 {
         return Err(WzError::DecompressionFailed("Data too short".into()));
@@ -122,13 +184,8 @@ pub fn decompress_png_data(compressed: &[u8], wz_key: Option<&[u8]>) -> WzResult
         (0x78, 0x9C) | (0x78, 0xDA) | (0x78, 0x01) | (0x78, 0x5E)
     );
 
-    let mut output = Vec::new();
-
     if is_zlib {
-        let mut decoder = ZlibDecoder::new(compressed);
-        decoder
-            .read_to_end(&mut output)
-            .map_err(|e| WzError::DecompressionFailed(e.to_string()))?;
+        inflate_lenient(compressed, true)
     } else if let Some(key) = wz_key {
         // list.wz encrypted block format: [blocksize:i32][XOR'd bytes]... → zlib after decrypt
         let mut cursor = Cursor::new(compressed);
@@ -158,18 +215,10 @@ pub fn decompress_png_data(compressed: &[u8], wz_key: Option<&[u8]>) -> WzResult
                 "Decrypted list.wz data too short".into(),
             ));
         }
-        let mut decoder = DeflateDecoder::new(&decrypted[2..]); // skip 2-byte zlib header
-        decoder
-            .read_to_end(&mut output)
-            .map_err(|e| WzError::DecompressionFailed(e.to_string()))?;
+        inflate_lenient(&decrypted[2..], false) // skip 2-byte zlib header
     } else {
-        let mut decoder = DeflateDecoder::new(compressed);
-        decoder
-            .read_to_end(&mut output)
-            .map_err(|e| WzError::DecompressionFailed(e.to_string()))?;
+        inflate_lenient(compressed, false)
     }
-
-    Ok(output)
 }
 
 #[cfg(test)]
@@ -285,8 +334,107 @@ mod tests {
 
     #[test]
     fn test_decompress_png_data_too_short() {
-        let err = decompress_png_data(&[0x78], None).unwrap_err();
-        matches!(err, WzError::DecompressionFailed(_));
+        for input in [&[][..], &[0x78][..]] {
+            let err = decompress_png_data(input, None).unwrap_err();
+            assert!(
+                matches!(err, WzError::DecompressionFailed(_)),
+                "expected DecompressionFailed for {input:?}, got {err:?}"
+            );
+        }
+    }
+
+    // ── unterminated streams (WZ canvas shape) ─────────────────────
+    //
+    // WZ canvas blobs end without a BFINAL block or an adler32 trailer, so an
+    // inflater never sees a stream terminator. Reproduced here with a
+    // sync-flushed (never finished) stream, which has exactly that shape.
+
+    /// zlib-headed stream carrying `payload` but never terminated.
+    fn unterminated_zlib(payload: &[u8]) -> Vec<u8> {
+        use flate2::{Compress, FlushCompress};
+
+        let mut deflater = Compress::new(Compression::default(), true);
+        let mut out = Vec::with_capacity(payload.len() + 128);
+        deflater
+            .compress_vec(payload, &mut out, FlushCompress::Sync)
+            .unwrap();
+        // No `FlushCompress::Finish` → no BFINAL block, no adler32 trailer.
+        assert_eq!(deflater.total_in() as usize, payload.len());
+        out
+    }
+
+    #[test]
+    fn test_decompress_png_data_unterminated_zlib_canvas() {
+        // A real 26×16 BGRA4444 face canvas: 832 = w·h·2 raw bytes, stored as
+        // an unterminated stream. The decoded length must be exactly w·h·2 and
+        // the pixels must survive the missing terminator.
+        let (w, h) = (26u32, 16u32);
+        let expected_len = WzPngFormat::Bgra4444.raw_data_size(w, h);
+        assert_eq!(expected_len, (w * h * 2) as usize);
+
+        let payload: Vec<u8> = (0..expected_len).map(|i| (i % 251) as u8).collect();
+        let stream = unterminated_zlib(&payload);
+
+        let raw = decompress_png_data(&stream, None).unwrap();
+        assert_eq!(raw.len(), expected_len, "truncated stream lost pixel bytes");
+        assert_eq!(raw, payload);
+
+        // …and the canvas still decodes end-to-end to RGBA8888.
+        let rgba = decode_pixels(&raw, w, h, WzPngFormat::Bgra4444).unwrap();
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+    }
+
+    #[test]
+    fn test_decompress_png_data_unterminated_raw_deflate() {
+        use flate2::{Compress, FlushCompress};
+
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 97) as u8).collect();
+        let mut deflater = Compress::new(Compression::default(), false); // raw deflate
+        let mut stream = Vec::with_capacity(payload.len() + 128);
+        deflater
+            .compress_vec(&payload, &mut stream, FlushCompress::Sync)
+            .unwrap();
+
+        let raw = decompress_png_data(&stream, None).unwrap();
+        assert_eq!(raw, payload);
+    }
+
+    #[test]
+    fn test_decompress_png_data_unterminated_encrypted_blocks() {
+        let payload: Vec<u8> = (0..1024).map(|i| (i % 211) as u8).collect();
+        let zlib_data = unterminated_zlib(&payload);
+
+        let mut compressed = Vec::new();
+        compressed.extend_from_slice(&(zlib_data.len() as i32).to_le_bytes());
+        compressed.extend_from_slice(&zlib_data);
+
+        let key = vec![0u8; zlib_data.len()]; // zero key → XOR is a no-op
+        let raw = decompress_png_data(&compressed, Some(&key)).unwrap();
+        assert_eq!(raw, payload);
+    }
+
+    #[test]
+    fn test_decompress_png_data_corrupt_still_errors() {
+        // Tolerating a missing terminator must not swallow real data errors.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            // zlib header + stored block whose NLEN is not !LEN
+            (
+                "invalid stored block lengths",
+                vec![0x78, 0x9C, 0x00, 0x05, 0x00, 0x00, 0x00, 1, 2, 3, 4, 5],
+            ),
+            // raw deflate with the reserved block type 0b11
+            ("reserved block type", vec![0xFF, 0xFF, 0x00, 0x00]),
+            // zlib header, then nothing decodable at all
+            ("empty after header", vec![0x78, 0x9C]),
+        ];
+
+        for (what, input) in cases {
+            let err = decompress_png_data(&input, None).unwrap_err();
+            assert!(
+                matches!(err, WzError::DecompressionFailed(_)),
+                "{what}: expected DecompressionFailed, got {err:?}"
+            );
+        }
     }
 
     #[test]
