@@ -18,7 +18,9 @@ pub use wz::file::{
 pub use wz::header::WzHeader;
 pub use wz::image::parse_image as parse_wz_image;
 pub use wz::image::parse_image_lazy as parse_wz_image_lazy;
+pub use wz::image::parse_image_path as parse_wz_image_path;
 pub use wz::image::parse_image_path_lazy as parse_wz_image_path_lazy;
+pub use wz::image::parse_image_root_keys as parse_wz_image_root_keys;
 pub use wz::keys::WzKey;
 pub use wz::list_file::{
     parse_list_file, parse_list_file_with_iv, parse_list_file_with_iv_and_user_key,

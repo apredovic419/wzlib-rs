@@ -126,13 +126,30 @@ pub fn parse_image_path_lazy<R: Read + Seek>(
     result
 }
 
-fn parse_image_path<R: Read + Seek>(
+/// [`parse_image_path_lazy`] without the zero-copy canvas contract: Canvas
+/// `png_data` on the matched node is **copied** out of the reader, so the
+/// reader does not have to be an in-memory buffer — a seekable file works, and
+/// only the bytes along `path` (plus the block-size seeks past siblings) are
+/// ever read.
+pub fn parse_image_path<R: Read + Seek>(
     reader: &mut WzBinaryReader<R>,
     path: &[&str],
 ) -> WzResult<Option<WzProperty>> {
     if path.is_empty() {
         return Err(WzError::Custom("parse_image_path: empty path".into()));
     }
+    let offset = locate_root_property_list(reader)?;
+    parse_property_list_path(reader, offset, path)
+}
+
+/// Read the IMG header and leave the reader at the root property list's
+/// count — the cursor [`parse_property_list`] starts from — returning the
+/// image `offset` that string blocks resolve against. Handles both header
+/// forms (`0x73` inline string, `0x1B` offset string) and retries the known
+/// IVs when the image was encrypted differently from its directory (mirrors
+/// `parse_image`'s `try_iv_fallback`). `0x01` Lua images have no property
+/// list and are rejected.
+fn locate_root_property_list<R: Read + Seek>(reader: &mut WzBinaryReader<R>) -> WzResult<u64> {
     let offset = reader.position()?;
     let header_byte = reader.read_u8()?;
     match header_byte {
@@ -141,17 +158,14 @@ fn parse_image_path<R: Read + Seek>(
             let prop_str = reader.read_wz_string()?;
             let val = reader.read_u16()?;
             if prop_str == "Property" && val == 0 {
-                return parse_property_list_path(reader, offset, path);
+                return Ok(offset);
             }
-            // Image encrypted with a different IV than the directory — retry
-            // the known IVs (mirrors `parse_image`'s `try_iv_fallback`), then
-            // traverse the path with the matching key.
             for &iv in &KNOWN_IVS {
                 reader.wz_key = WzKey::new(iv);
                 reader.seek(pos_after_header)?;
                 if let Ok(s) = reader.read_wz_string() {
                     if s == "Property" && reader.read_u16()? == 0 {
-                        return parse_property_list_path(reader, offset, path);
+                        return Ok(offset);
                     }
                 }
             }
@@ -163,13 +177,39 @@ fn parse_image_path<R: Read + Seek>(
             let prop_str = reader.read_string_at_offset(string_pos)?;
             let val = reader.read_u16()?;
             if prop_str == "Property" && val == 0 {
-                return parse_property_list_path(reader, offset, path);
+                return Ok(offset);
             }
             Err(WzError::InvalidImageHeader(0x1B))
         }
         // 0x01 (Lua) has no addressable property path.
         other => Err(WzError::InvalidImageHeader(other)),
     }
+}
+
+/// The names of the root property list's children, **without** parsing any
+/// of their values: each value is stepped over by [`skip_property_value`], so
+/// an extended subtree costs one block-size seek.
+///
+/// For an IMG with many top-level entries this is a header read plus one seek
+/// per entry — a cheap way to learn which keys a file contains before deciding
+/// whether a [`parse_image_path`] / [`parse_image_path_lazy`] is worth doing.
+pub fn parse_image_root_keys<R: Read + Seek>(
+    reader: &mut WzBinaryReader<R>,
+) -> WzResult<Vec<String>> {
+    let offset = locate_root_property_list(reader)?;
+    let count = reader.read_compressed_int()?;
+    if !(0..=super::MAX_PROPERTY_COUNT).contains(&count) {
+        return Err(WzError::Custom(format!(
+            "Invalid property count: {}",
+            count
+        )));
+    }
+    let mut keys = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        keys.push(reader.read_string_block(offset)?);
+        skip_property_value(reader, offset)?;
+    }
+    Ok(keys)
 }
 
 /// Walk one property list looking for `path[0]`. On a match: if it is the
