@@ -617,6 +617,40 @@ class TestXmlExport:
         with pytest.raises(RuntimeError):
             WzImage.from_xml("not xml at all <<<")
 
+    @staticmethod
+    def _tiny_png_b64():
+        """A 2x1 RGBA PNG built with the stdlib only (no Pillow in the test deps)."""
+        import base64, struct, zlib
+
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+        raw = b"\x00" + bytes([255, 0, 0, 255, 0, 0, 255, 128])
+        png = (b"\x89PNG\r\n\x1a\n"
+               + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 1, 8, 6, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(raw))
+               + chunk(b"IEND", b""))
+        return base64.b64encode(png).decode()
+
+    @pytest.mark.parametrize("attr,want", [("", 2), (' format="1"', 1), (' format="2050"', 2)])
+    def test_from_xml_canvas_format(self, attr, want):
+        """A canvas `format` attribute picks the stored codec; default stays BGRA8888."""
+        img = WzImage.from_xml(
+            f'<imgdir name="t.img"><canvas name="c" width="2" height="1"{attr} '
+            f'basedata="{self._tiny_png_b64()}"/></imgdir>'
+        )
+        node = img.get("c")
+        assert node.canvas_format() == want
+        rgba, w, h = node.decode_canvas()
+        assert (w, h) == (2, 1)
+        assert rgba[:4] == bytes([255, 0, 0, 255])
+
+    def test_canvas_format_rejects_non_canvas(self, sample_image_with_properties):
+        img = WzImage.from_bytes(sample_image_with_properties)
+        with pytest.raises(ValueError):
+            img.get(img.children()[0]).canvas_format()
+
     def test_to_xml_named(self, sample_image_with_properties):
         """to_xml with name argument uses correct root name."""
         img = WzImage.from_bytes(sample_image_with_properties)

@@ -928,6 +928,24 @@ impl WzNode {
         Ok(children.len() < before)
     }
 
+    /// The WZ pixel-codec id a Canvas node is stored in (`1` = BGRA4444,
+    /// `2` = BGRA8888, `513` = RGB565, `2050` = DXT5, ...). Reads the header
+    /// only; no pixel data is decompressed.
+    fn canvas_format(&self) -> PyResult<u32> {
+        let root = self.root.read().map_err(|_| lock_err())?;
+        let parts = self.path_parts_ref();
+        let prop = get_prop(&root, &parts)
+            .ok_or_else(|| PyKeyError::new_err(self.path.join("/")))?;
+        match prop {
+            WzProperty::Canvas { format, .. } => Ok(format.format_id()),
+            other => Err(PyValueError::new_err(format!(
+                "Node '{}' is {}, not Canvas",
+                self.path.join("/"),
+                prop_type_name(other)
+            ))),
+        }
+    }
+
     /// Decode a Canvas node to raw RGBA8888 bytes.
     /// Returns (rgba_bytes, width, height).
     /// If the canvas has an `_outlink` child pointing to a /_Canvas/ shard,

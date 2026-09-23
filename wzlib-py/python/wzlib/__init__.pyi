@@ -181,6 +181,17 @@ class WzNode:
         """
         ...
 
+    def canvas_format(self) -> int:
+        """The WZ pixel-codec id this Canvas is stored in.
+
+        ``1`` = BGRA4444, ``2`` = BGRA8888, ``513`` = RGB565, ``1026`` = DXT3,
+        ``2050`` = DXT5. Reads the canvas header only.
+
+        :raises ValueError: if this node is not a Canvas.
+        :raises KeyError: if this node no longer exists in the tree.
+        """
+        ...
+
     def decode_canvas(self) -> tuple[bytes, int, int]:
         """Decode a Canvas node to raw RGBA8888 pixel data.
 

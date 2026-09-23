@@ -318,6 +318,9 @@ def _get_node_result(node, path: str) -> dict:
         value = node.as_str()
 
     result = {"path": path, "type": ntype, "value": value}
+    if ntype == "Canvas":
+        # WZ pixel-codec id (1 = BGRA4444, 2 = BGRA8888, ...): header only, cheap.
+        result["format"] = node.canvas_format()
     children = node.children()
     if children:
         result["children"] = children
@@ -360,6 +363,8 @@ def cmd_get(args):
                 print(f"Value: {r['value']}")
             elif r["type"] == "Null":
                 print("Value: null")
+            if "format" in r:
+                print(f"Format: {r['format']}")
             if r.get("children"):
                 print(f"Children: {', '.join(r['children'])}")
 

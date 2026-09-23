@@ -736,8 +736,27 @@ fn png_bytes_to_rgba(png_bytes: &[u8]) -> WzResult<(u32, u32, Vec<u8>)> {
     Ok((w, h, rgba))
 }
 
-/// Parse Canvas `basedata` attribute: standard PNG → WZ png_data (BGRA8888, zlib-compressed).
-/// Returns `(format, png_data)`. If `basedata` is absent or invalid, returns empty data.
+/// Pixel codec an imported canvas is stored in.
+///
+/// HaRepacker-style XML carries no codec, so the default stays BGRA8888 (lossless).
+/// A `format` attribute holding a WZ codec id (`1` = BGRA4444, `2` = BGRA8888,
+/// `513` = RGB565 — the three this crate can *encode*) overrides it; any other
+/// value falls back to the default rather than failing the import. `export_wz_xml`
+/// never writes the attribute, so ordinary round trips are unchanged.
+fn import_canvas_format(attrs: &HashMap<String, String>) -> WzPngFormat {
+    match attrs
+        .get("format")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(WzPngFormat::from_combined)
+    {
+        Some(f @ (WzPngFormat::Bgra4444 | WzPngFormat::Bgra8888 | WzPngFormat::Rgb565)) => f,
+        _ => WzPngFormat::Bgra8888,
+    }
+}
+
+/// Parse Canvas `basedata` attribute: standard PNG → WZ png_data (zlib-compressed, in
+/// the codec [`import_canvas_format`] picks). Returns `(format, png_data)`. If
+/// `basedata` is absent or invalid, returns empty data.
 fn canvas_from_basedata(
     attrs: &HashMap<String, String>,
     _hint_width: i32,
@@ -751,9 +770,10 @@ fn canvas_from_basedata(
         Ok(b) => b,
         Err(_) => return (WzPngFormat::Bgra8888, Vec::new()),
     };
+    let format = import_canvas_format(attrs);
     match png_bytes_to_rgba(&png_bytes) {
         Ok((w, h, rgba)) => {
-            let wz_pixels = match image_encode::encode_pixels(&rgba, w, h, WzPngFormat::Bgra8888) {
+            let wz_pixels = match image_encode::encode_pixels(&rgba, w, h, format) {
                 Ok(p) => p,
                 Err(_) => return (WzPngFormat::Bgra8888, Vec::new()),
             };
@@ -761,7 +781,7 @@ fn canvas_from_basedata(
                 Ok(c) => c,
                 Err(_) => return (WzPngFormat::Bgra8888, Vec::new()),
             };
-            (WzPngFormat::Bgra8888, compressed)
+            (format, compressed)
         }
         Err(_) => (WzPngFormat::Bgra8888, Vec::new()),
     }
@@ -843,6 +863,66 @@ mod tests {
         let xml = export_wz_xml("test.img", &props, &XmlMode::MetadataOnly);
         assert!(xml.contains("name=\"a&amp;b\""));
         assert!(xml.contains("value=\"val&lt;&gt;&quot;\""));
+    }
+
+    fn tiny_png_b64() -> String {
+        // 2x1: opaque red, half-transparent blue.
+        let rgba = [255u8, 0, 0, 255, 0, 0, 255, 128];
+        let mut png = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png, 2, 1);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+        }
+        base64::engine::general_purpose::STANDARD.encode(png)
+    }
+
+    fn import_one_canvas(format_attr: &str) -> WzProperty {
+        let xml = format!(
+            r#"<imgdir name="t.img"><canvas name="c" width="2" height="1"{format_attr} basedata="{}"/></imgdir>"#,
+            tiny_png_b64()
+        );
+        let (_, mut props) = import_wz_xml(&xml).unwrap();
+        props.remove(0).1
+    }
+
+    #[test]
+    fn test_import_canvas_format_attr() {
+        for (attr, want) in [
+            ("", WzPngFormat::Bgra8888),
+            (r#" format="1""#, WzPngFormat::Bgra4444),
+            (r#" format="2""#, WzPngFormat::Bgra8888),
+            (r#" format="513""#, WzPngFormat::Rgb565),
+            // Not encodable / not a number: the lossless default, never a failed import.
+            (r#" format="2050""#, WzPngFormat::Bgra8888),
+            (r#" format="dxt""#, WzPngFormat::Bgra8888),
+        ] {
+            let WzProperty::Canvas {
+                format, png_data, ..
+            } = import_one_canvas(attr)
+            else {
+                panic!("expected Canvas");
+            };
+            assert_eq!(format, want, "attr {attr:?}");
+            let raw = image::decompress_png_data(png_data.as_bytes(), None).unwrap();
+            assert_eq!(raw.len(), want.raw_data_size(2, 1), "attr {attr:?}");
+        }
+    }
+
+    #[test]
+    fn test_import_bgra4444_decodes_back() {
+        let WzProperty::Canvas {
+            format, png_data, ..
+        } = import_one_canvas(r#" format="1""#)
+        else {
+            panic!("expected Canvas");
+        };
+        let raw = image::decompress_png_data(png_data.as_bytes(), None).unwrap();
+        let rgba = image::decode_pixels(&raw, 2, 1, format).unwrap();
+        // 4-bit channels: 255 stays 255, 128 rounds to level 8 -> 0x88.
+        assert_eq!(&rgba[..4], &[255, 0, 0, 255]);
+        assert_eq!(&rgba[4..], &[0, 0, 255, 0x88]);
     }
 
     #[test]
