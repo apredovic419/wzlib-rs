@@ -55,6 +55,11 @@ pub fn compress_png_data(raw: &[u8]) -> WzResult<Vec<u8>> {
 
 // ── Per-format encoders ─────────────────────────────────────────────
 
+/// 8-bit channel -> nearest 4-bit level (decoded back as `n * 17`).
+fn to_nibble(v: u8) -> u8 {
+    ((v as u16 * 15 + 127) / 255) as u8
+}
+
 fn rgba_to_bgra4444(rgba: &[u8], pixel_count: usize) -> Vec<u8> {
     let mut out = vec![0u8; pixel_count * 2];
     for i in 0..pixel_count {
@@ -64,10 +69,12 @@ fn rgba_to_bgra4444(rgba: &[u8], pixel_count: usize) -> Vec<u8> {
             rgba[i * 4 + 2],
             rgba[i * 4 + 3],
         );
-        let r4 = r >> 4;
-        let g4 = g >> 4;
-        let b4 = b >> 4;
-        let a4 = a >> 4;
+        // Nearest of the 16 levels the decoder expands to (`n * 17`), not a
+        // truncating `>> 4`, which misses by up to 16 (0x1F -> 0x11) instead of 8.
+        let r4 = to_nibble(r);
+        let g4 = to_nibble(g);
+        let b4 = to_nibble(b);
+        let a4 = to_nibble(a);
         // lo = [B3..B0 | G3..G0], hi = [R3..R0 | A3..A0]
         out[i * 2] = b4 | (g4 << 4);
         out[i * 2 + 1] = r4 | (a4 << 4);
@@ -194,11 +201,17 @@ mod tests {
         let rgba = vec![0xF0, 0x80, 0x30, 0xA0];
         let encoded = encode_pixels(&rgba, 1, 1, WzPngFormat::Bgra4444).unwrap();
         let decoded = decode_pixels(&encoded, 1, 1, WzPngFormat::Bgra4444).unwrap();
-        // Each channel: val >> 4 then (nibble << 4) | nibble
-        assert_eq!(decoded[0], 0xFF); // 0xF0 >> 4 = 0xF → 0xFF
-        assert_eq!(decoded[1], 0x88); // 0x80 >> 4 = 0x8 → 0x88
-        assert_eq!(decoded[2], 0x33); // 0x30 >> 4 = 0x3 → 0x33
-        assert_eq!(decoded[3], 0xAA); // 0xA0 >> 4 = 0xA → 0xAA
+        // Each channel rounds to the nearest level n, decoded as n * 17.
+        assert_eq!(decoded[0], 0xEE); // 240: 238 (n=14) is nearer than 255
+        assert_eq!(decoded[1], 0x88); // 128 -> 136 (n=8)
+        assert_eq!(decoded[2], 0x33); // 48 -> 51 (n=3)
+        assert_eq!(decoded[3], 0x99); // 160: 153 (n=9) is nearer than 170
+                                      // The ends are exact: opaque stays opaque, clear stays clear.
+        let ends = encode_pixels(&[0, 255, 0, 255], 1, 1, WzPngFormat::Bgra4444).unwrap();
+        assert_eq!(
+            decode_pixels(&ends, 1, 1, WzPngFormat::Bgra4444).unwrap(),
+            vec![0, 255, 0, 255]
+        );
     }
 
     #[test]
